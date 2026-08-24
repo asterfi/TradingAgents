@@ -321,7 +321,8 @@ def sweep_expired_orders(now=None, dry_run=True):
     now = now or datetime.now(timezone.utc)
     report = {"checked": [], "expired": [], "cancelled": [], "errors": []}
     try:
-        resp = _mexc_request("GET", "/api/v1/private/order/list/open_orders")
+        resp = _mexc_request("GET", "/api/v1/private/order/list/open_orders",
+                             params={"page_num": 1, "page_size": 100})
         open_orders = resp.get("data") or []
     except Exception as e:
         report["errors"].append(f"list_open_orders: {e}")
