@@ -199,7 +199,7 @@ def place_bracket(payload, dry_run=True):
         "vol": str(vol),
         "leverage": payload["leverage"],
         "side": 1 if payload["side"] == "LONG" else 3,
-        "type": 2 if payload.get("execution") == "market" else 1,  # 2=market, 1=limit
+        "type": 5 if payload.get("execution") == "market" else 1,  # 5=market, 1=limit (MEXC futures type map: 1 limit, 2 post-only, 3 IOC, 4 FOK, 5 market)
         "openType": 2,  # CROSS margin (operator directive 2026-08-24; was 1=isolated)
         "positionMode": 2,  # one-way (single position per symbol)
         "stopLossPrice": str(payload["stop_loss"]),
