@@ -217,6 +217,26 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional target price in the instrument's quote currency.",
     )
+    take_profit: float | None = Field(
+        default=None,
+        description=(
+            "REQUIRED for Buy / Overweight / Sell / Underweight ratings: the "
+            "take-profit exit price in the instrument's quote currency, set from "
+            "the support/resistance levels you already identified. The reward "
+            "(entry to take-profit distance) must be at least 1x the risk "
+            "(entry to stop-loss distance) — target 2x or better. "
+            "Set null only for Hold."
+        ),
+    )
+    stop_loss: float | None = Field(
+        default=None,
+        description=(
+            "REQUIRED for Buy / Overweight / Sell / Underweight ratings: the "
+            "stop-loss exit price in the instrument's quote currency, placed "
+            "just beyond the key level that invalidates the trade (below support "
+            "for a long, above resistance for a short). Set null only for Hold."
+        ),
+    )
     execution_type: str = Field(
         default="limit",
         description=(
@@ -243,7 +263,7 @@ class PortfolioDecision(BaseModel):
         ),
     )
 
-    @field_validator("price_target", mode="before")
+    @field_validator("price_target", "take_profit", "stop_loss", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
@@ -266,6 +286,10 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     ]
     if decision.price_target is not None:
         parts.extend(["", f"**Price Target**: {decision.price_target}"])
+    if decision.take_profit is not None:
+        parts.extend(["", f"**Take Profit**: {decision.take_profit}"])
+    if decision.stop_loss is not None:
+        parts.extend(["", f"**Stop Loss**: {decision.stop_loss}"])
     if decision.execution_type:
         parts.extend(["", f"**Execution**: {decision.execution_type}"])
     if decision.time_horizon:
