@@ -395,7 +395,8 @@ def main():
 
     print(json.dumps({
         "ticker": args.ticker, "variant": args.variant, "provider": PROVIDER,
-        "model": DEEP_THINK_LLM, "verdict": verdict, "confidence": confidence,
+        "model": DEEP_THINK_LLM, "verdict": verdict, "ta_verdict": verdict,
+        "confidence": confidence, "close": close, "as_of": snap["as_of"],
         "trade_params": params, "thesis": thesis,
         "validation": validation,
         "elapsed_s": round(elapsed, 1),
