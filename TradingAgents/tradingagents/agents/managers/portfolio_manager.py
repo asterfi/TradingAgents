@@ -58,7 +58,7 @@ def create_portfolio_manager(llm):
 **TP / SL — ALWAYS REQUIRED for any non-Hold rating (Buy / Overweight / Underweight / Sell).** You already see the support/resistance levels in the data — set them now:
 - **Take Profit**: the level where the move is expected to exhaust (resistance for a long, support for a short). Reward = entry-to-TP distance.
 - **Stop Loss**: just beyond the level that invalidates the trade (below support for a long, above resistance for a short). Risk = entry-to-SL distance.
-- The reward must be **at least 1x the risk (1R)** — aim for **2R or better**; never accept a trade where the TP is closer than the SL.
+- The reward must be **at least 1x the risk (1R)** — never accept a trade where the TP is closer than the SL. Otherwise set the levels however your analysis dictates.
 - For a **Hold** rating, set both to null.
 
 **Order Invalidation (IMPORTANT for limit entries):** if you recommend a **limit** order, optionally state a price level at which the setup is dead and the resting order should be cancelled — e.g. "**Invalidation Price**: 768.00". For a SHORT, that is a price ABOVE which the short thesis is invalid; for a LONG, a price BELOW which the long thesis is invalid. This is NOT the stop loss (which protects an open position); it invalidates the entry *before* it fills. If there is no price invalidation, state "**Invalidation Price**: none".

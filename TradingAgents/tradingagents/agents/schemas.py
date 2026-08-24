@@ -224,8 +224,7 @@ class PortfolioDecision(BaseModel):
             "take-profit exit price in the instrument's quote currency, set from "
             "the support/resistance levels you already identified. The reward "
             "(entry to take-profit distance) must be at least 1x the risk "
-            "(entry to stop-loss distance) — target 2x or better. "
-            "Set null only for Hold."
+            "(entry to stop-loss distance). Set null only for Hold."
         ),
     )
     stop_loss: float | None = Field(
