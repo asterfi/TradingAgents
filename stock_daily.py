@@ -151,7 +151,7 @@ def stage_from_verdict(res):
     return build_bracket(ticker, side, entry, tp, sl,
                          equity_usd=_live_equity_usd(), risk_pct=RISK_PCT,
                          execution=params.get("execution", "limit"),
-                         expiry=params.get("expiry"))
+                         invalidation=params.get("invalidation"))
 
 
 def _portal_healthy(timeout=20):
@@ -296,6 +296,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preopen", action="store_true", help="pre-open TA + order staging")
     ap.add_argument("--screen", action="store_true", help="NY-open fast screen")
+    ap.add_argument("--sweep", action="store_true",
+                    help="cancel stale unfilled brackets (post-open cleanup + price invalidation)")
     ap.add_argument("--date", default=None)
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--execute", action="store_true", help="place staged orders live")
@@ -305,6 +307,11 @@ def main():
         return preopen(date, test=args.test, execute=args.execute)
     if args.screen:
         return screen_phase(test=args.test)
+    if args.sweep:
+        from mexc_orders import sweep_stale_brackets
+        rep = sweep_stale_brackets(dry_run=not args.execute)
+        print(json.dumps(rep, indent=1))
+        return 0 if not rep["errors"] else 2
     ap.print_help()
     return 1
 

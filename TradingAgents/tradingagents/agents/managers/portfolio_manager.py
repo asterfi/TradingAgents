@@ -55,7 +55,7 @@ def create_portfolio_manager(llm):
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
 
-**Order Expiry (IMPORTANT for limit entries):** if you recommend a **limit** order, you MUST state an explicit invalidation cutoff so the order does not hang unfilled forever — e.g. "**Order Expiry**: valid until 15:30 UTC" or "expire 2 hours after open". If the entry is **market** or **none**, state "**Order Expiry**: none".
+**Order Invalidation (IMPORTANT for limit entries):** if you recommend a **limit** order, optionally state a price level at which the setup is dead and the resting order should be cancelled — e.g. "**Invalidation Price**: 768.00". For a SHORT, that is a price ABOVE which the short thesis is invalid; for a LONG, a price BELOW which the long thesis is invalid. This is NOT the stop loss (which protects an open position); it invalidates the entry *before* it fills. If there is no price invalidation, state "**Invalidation Price**: none".
 
 **Context:**
 - Research Manager's investment plan: **{research_plan}**

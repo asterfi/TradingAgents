@@ -228,7 +228,7 @@ def thesis_from_decision(text, limit=220):
 def parse_trade_params(text, close):
     """Extract entry/TP/SL from decision text (best-effort, unit = price)."""
     params = {"entry": None, "take_profit": None, "stop_loss": None,
-              "risk_reward": None, "execution": "limit", "expiry": None}
+              "risk_reward": None, "execution": "limit", "invalidation": None}
     if not text:
         return params
     pats = {
@@ -243,15 +243,17 @@ def parse_trade_params(text, close):
                 params[k] = float(m.group(1))
             except ValueError:
                 pass
-    # expiry / invalidation cutoff for limit orders (spec: no hanging GTC)
-    em = re.search(
-        r"(?:order[\s-]?expiry|expiry|expire(?:s|d)?|invalidat(?:e|ion)?|valid(?: until| for))"
-        r"[*:\s]*([^\n*]+)", text, re.IGNORECASE)
-    if em:
-        raw = em.group(1).strip().strip('"\'`')
-        raw = re.sub(r"\s+", " ", raw)
-        if raw.lower() not in ("none", "n/a", "na", "-"):
-            params["expiry"] = raw[:80]
+    # price invalidation: level at which the setup is dead (cancel resting order)
+    im = re.search(
+        r"(?:invalidation(?: price)?|invalidat(?:e|ion)?(?: above| below)?)"
+        r"[*:\s]*\$?\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    if im:
+        try:
+            v = float(im.group(1))
+            if v > 0:
+                params["invalidation"] = v
+        except ValueError:
+            pass
     # execution type from the PM decision (spec §9): market | limit | none
     em = re.search(r"(?:execution|order type|entry type)[*:\s]*\$?\s*(market|limit|none)",
                    text, re.IGNORECASE)

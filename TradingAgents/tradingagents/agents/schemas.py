@@ -231,13 +231,15 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
-    order_expiry: str | None = Field(
+    invalidation_price: float | None = Field(
         default=None,
         description=(
-            "MANDATORY for limit orders. How long the resting limit order stays "
-            "valid before it is auto-cancelled if unfilled. Give an explicit "
-            "cutoff, e.g. '2 hours after open' or 'valid until 15:30 UTC'. "
-            "If execution_type is 'market' or 'none', set this to null."
+            "OPTIONAL price level at which the setup is invalidated and a "
+            "resting limit order should be cancelled. For a SHORT: if price "
+            "trades ABOVE this level, the short thesis is dead. For a LONG: "
+            "if price trades BELOW this level, the long thesis is dead. Set "
+            "null if there is no price invalidation. This is NOT the stop "
+            "loss — it invalidates the entry before it fills, not the position."
         ),
     )
 
@@ -268,8 +270,8 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         parts.extend(["", f"**Execution**: {decision.execution_type}"])
     if decision.time_horizon:
         parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
-    if decision.order_expiry:
-        parts.extend(["", f"**Order Expiry**: {decision.order_expiry}"])
+    if decision.invalidation_price is not None:
+        parts.extend(["", f"**Invalidation Price**: {decision.invalidation_price}"])
     return "\n".join(parts)
 
 
