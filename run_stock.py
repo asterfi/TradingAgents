@@ -183,46 +183,58 @@ def parse_verdict(text):
     return mapping[label], conf
 
 
-def thesis_from_decision(text, limit=220):
-    """Short high-level thesis for the notification digest.
+def thesis_from_decision(text, limit=140):
+    """One-sentence "why" for the digest.
 
-    Takes the Portfolio Manager's final reasoning, drops the leading
-    Action/Verdict line, and trims to a readable sentence or two.
+    Operator directive 2026-08-24: each asset gets ONE plain sentence the
+    operator can read and understand. We prefer the Executive Summary /
+    Investment Thesis body; if the PM only emits label lines, fall back to
+    the first substantive sentence anywhere.
     """
     if not text:
         return None
     body = text.strip()
-    # Drop leading label lines repeatedly: "**Rating**: X", "**Executive
-    # Summary**", etc. — a decision can carry several stacked headers.
-    MARKERS = ("**Action**", "Action:", "**Decision**", "Verdict:",
-               "**Rating**", "**Executive Summary**", "Executive Summary:")
-    for _ in range(6):
-        stripped = False
-        for marker in MARKERS:
-            i = body.find(marker)
-            if i == 0 or (i > 0 and body[:i].strip() in ("", "-", "**")):
-                rest = body[i + len(marker):]
-                nl = rest.find("\n")
-                if nl != -1:
-                    body = rest[nl + 1:].strip()
-                    stripped = True
-                    break
-        if not stripped:
+    same_line_label = False
+    # 1) Prefer the text right after the Thesis / Executive Summary header.
+    for marker in ("**Investment Thesis**:", "**Investment Thesis**: ",
+                   "Investment Thesis:", "**Executive Summary**:", "**Executive Summary**: ",
+                   "Executive Summary:", "**Thesis**:", "**Thesis**: ", "Thesis:"):
+        i = body.find(marker)
+        if i != -1:
+            body = body[i + len(marker):].strip()
             break
-    # first sentence-ish, no newlines, strip residual markdown bold markers
+    else:
+        # 2) No such header: drop any leading **Rating**: / Action / Verdict
+        #    label line so we land on the reasoning body.
+        for marker in ("**Rating**", "Rating:", "**Action**", "Action:",
+                       "**Decision**", "Decision:", "**Verdict**", "Verdict:"):
+            if body.startswith(marker):
+                nl = body.find("\n")
+                if nl != -1 and body[nl + 1:].strip():
+                    body = body[nl + 1:].strip()
+                else:
+                    # rating and reason on the same line: strip the label
+                    body = body[len(marker):].lstrip(": ").strip()
+                    same_line_label = True
+                break
+    # First sentence only: cut at a real boundary (". " + capital, or end).
     body = re.sub(r"\s+", " ", body).strip()
-    body = body.replace("**", "")
+    body = body.replace("**", "").strip()
+    body = body.lstrip(": ").strip()
+    if not body:
+        return None
+    # If the reason shares a line with its label ("Sell. AMD rolling over…"),
+    # the label's own period is NOT a sentence end — skip the first boundary.
+    if same_line_label:
+        body = body.split(". ", 1)[-1].strip() if ". " in body else body
+    m = re.search(r"[.!?](?=\s+[A-Z0-9]|\s*$)", body)
+    if m:
+        body = body[:m.end()].strip()
     if not body:
         return None
     if len(body) <= limit:
         return body
-    cut = body[:limit]
-    # end at a sentence boundary when possible
-    for end in (". ", "! ", "? "):
-        i = cut.rfind(end)
-        if i > limit * 0.6:
-            return cut[:i + 1]
-    return cut + "…"
+    return body[:limit].rstrip() + "…"
 
 
 def parse_trade_params(text, close):
