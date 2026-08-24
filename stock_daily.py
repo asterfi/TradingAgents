@@ -174,10 +174,14 @@ def _portal_healthy(timeout=20):
             return False
         from openai import OpenAI
         c = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
+        # Probe with a non-reasoning model that returns plain content — the
+        # pinned 0731 is a reasoning model: with a small max_tokens it spends
+        # the whole budget on reasoning and returns content=None, which would
+        # falsely fail the health probe. Use a cheap content model instead.
         r = c.chat.completions.create(
-            model="deepseek/deepseek-v4-flash-0731",
+            model="openai/gpt-4o-mini",
             messages=[{"role": "user", "content": "say OK"}], max_tokens=8)
-        return bool((r.choices[0].message.content or "").strip())
+        return bool(r.choices) and bool((r.choices[0].message.content or "").strip())
     except Exception:
         return False
 
