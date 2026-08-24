@@ -231,6 +231,15 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    order_expiry: str | None = Field(
+        default=None,
+        description=(
+            "MANDATORY for limit orders. How long the resting limit order stays "
+            "valid before it is auto-cancelled if unfilled. Give an explicit "
+            "cutoff, e.g. '2 hours after open' or 'valid until 15:30 UTC'. "
+            "If execution_type is 'market' or 'none', set this to null."
+        ),
+    )
 
     @field_validator("price_target", mode="before")
     @classmethod
@@ -259,6 +268,8 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         parts.extend(["", f"**Execution**: {decision.execution_type}"])
     if decision.time_horizon:
         parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+    if decision.order_expiry:
+        parts.extend(["", f"**Order Expiry**: {decision.order_expiry}"])
     return "\n".join(parts)
 
 

@@ -228,7 +228,7 @@ def thesis_from_decision(text, limit=220):
 def parse_trade_params(text, close):
     """Extract entry/TP/SL from decision text (best-effort, unit = price)."""
     params = {"entry": None, "take_profit": None, "stop_loss": None,
-              "risk_reward": None, "execution": "limit"}
+              "risk_reward": None, "execution": "limit", "expiry": None}
     if not text:
         return params
     pats = {
@@ -243,6 +243,15 @@ def parse_trade_params(text, close):
                 params[k] = float(m.group(1))
             except ValueError:
                 pass
+    # expiry / invalidation cutoff for limit orders (spec: no hanging GTC)
+    em = re.search(
+        r"(?:order[\s-]?expiry|expiry|expire(?:s|d)?|invalidat(?:e|ion)?|valid(?: until| for))"
+        r"[*:\s]*([^.]+)", text, re.IGNORECASE)
+    if em:
+        raw = em.group(1).strip().strip('"\'`')
+        raw = re.sub(r"\s+", " ", raw)
+        if raw.lower() not in ("none", "n/a", "na", "-"):
+            params["expiry"] = raw[:80]
     # execution type from the PM decision (spec §9): market | limit | none
     em = re.search(r"(?:execution|order type|entry type)[*:\s]*\$?\s*(market|limit|none)",
                    text, re.IGNORECASE)

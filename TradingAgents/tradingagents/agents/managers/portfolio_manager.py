@@ -55,6 +55,8 @@ def create_portfolio_manager(llm):
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
 
+**Order Expiry (IMPORTANT for limit entries):** if you recommend a **limit** order, you MUST state an explicit invalidation cutoff so the order does not hang unfilled forever — e.g. "**Order Expiry**: valid until 15:30 UTC" or "expire 2 hours after open". If the entry is **market** or **none**, state "**Order Expiry**: none".
+
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**

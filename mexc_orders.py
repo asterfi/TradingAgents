@@ -24,10 +24,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 LANE = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = os.environ.get("MEXC_API_BASE", "https://api.mexc.com")
@@ -144,12 +145,15 @@ def get_contract(symbol):
 
 def build_bracket(ticker, side, entry, take_profit, stop_loss,
                   equity_usd=DEFAULT_EQUITY_USD, risk_pct=DEFAULT_RISK_PCT,
-                  mexc_symbol=None, execution="limit"):
+                  mexc_symbol=None, execution="limit", expiry=None):
     """Build the order payload for one bracket.
 
     Returns dict with MEXC fields + a human summary. Does NOT place anything.
     ``execution``: 'market' = immediate market entry at NY open (TP/SL attached);
     'limit' (default) = rest a limit order at ``entry``.
+    ``expiry``: PM-suggested invalidation cutoff for limit orders (e.g.
+    "2 hours after open", "valid until 15:30 UTC"). Stored for the sweep that
+    cancels unfilled limit orders once stale.
     """
     mexc_symbol = mexc_symbol or TICKER_TO_MEXC[ticker]
     if side not in ("LONG", "SHORT"):
@@ -158,12 +162,15 @@ def build_bracket(ticker, side, entry, take_profit, stop_loss,
         raise ValueError("stop too close to entry")
     risk = equity_usd * risk_pct
     lev = _leverage_for(mexc_symbol)
+    exp_utc = parse_expiry_to_utc(expiry)
     return {
         "ticker": ticker, "mexc_symbol": mexc_symbol, "side": side,
         "entry": round(entry, 2), "take_profit": round(take_profit, 2),
         "stop_loss": round(stop_loss, 2), "risk_usd": round(risk, 2),
         "risk_pct": risk_pct, "leverage": lev,
         "execution": execution if execution in ("market", "limit") else "limit",
+        "expiry": expiry,
+        "expiry_utc": exp_utc.isoformat() if exp_utc else None,
         "status": "staged",
     }
 
@@ -230,6 +237,24 @@ def cancel_order(mexc_symbol, order_id=None):
     return resp
 
 
+def cancel_leftover_brackets():
+    """Cancel any still-resting entry brackets on our universe before a fresh run.
+
+    Unfilled limit entries from a prior preopen must not stack with today's
+    new brackets (operator directive 2026-08-24: no hanging orders). Only
+    touches open *orders* on our 5 symbols — positions and their attached
+    TP/SL are untouched.
+    """
+    cancelled = []
+    for ticker, sym in TICKER_TO_MEXC.items():
+        try:
+            cancel_order(sym)
+            cancelled.append(sym)
+        except Exception as e:
+            cancelled.append(f"{sym}: {str(e)[:80]}")
+    return cancelled
+
+
 def load_orders():
     if os.path.exists(ORDER_FILE):
         try:
@@ -237,6 +262,104 @@ def load_orders():
         except (json.JSONDecodeError, OSError):
             pass
     return {"date": None, "orders": []}
+
+
+def parse_expiry_to_utc(expiry, staged_at=None):
+    """Convert a PM-suggested expiry string into an absolute UTC datetime.
+
+    Accepts the forms the PM is told to emit:
+      - "N hours after open" / "expire 2 hours after open"  (open = 13:30 UTC)
+      - "valid until HH:MM UTC" / "until 15:30 UTC" / "HH:MM UTC"
+      - "end of day" / "market close"  -> 20:00 UTC
+      - "none" / missing  -> None (never expires)
+
+    Returns a timezone-aware datetime or None. Never raises: unparseable text
+    yields None so the sweep is fail-safe (keeps the order rather than
+    cancelling something we cannot reason about).
+    """
+    if not expiry:
+        return None
+    t = expiry.strip().lower()
+    if t in ("none", "n/a", "na", "-", "null", "never"):
+        return None
+    base = staged_at or datetime.now(timezone.utc)
+    NY_OPEN_UTC = 13.5  # 13:30 UTC
+    # "N hours after open"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:hour|hr|h)\w*\s*(?:after|from|post)\s*(?:the\s*)?open", t)
+    if m:
+        hours = float(m.group(1))
+        open_dt = base.replace(hour=int(NY_OPEN_UTC), minute=int((NY_OPEN_UTC % 1) * 60), second=0, microsecond=0)
+        return open_dt + timedelta(hours=hours)
+    # "N hours" (relative to stage time)
+    m = re.search(r"(?:expire|expires|valid|for)\s*(?:in\s*)?(\d+(?:\.\d+)?)\s*(?:hour|hr|h)", t)
+    if m:
+        return base + timedelta(hours=float(m.group(1)))
+    # "HH:MM UTC" or "until HH:MM UTC"
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(?:utc|et|est|edt)?", t)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if "et" in t or "est" in t or "edt" in t:
+            hh += 4  # ET (EDT) -> UTC
+        cut = base.replace(hour=hh % 24, minute=mm, second=0, microsecond=0)
+        # "until 9:30" means later today; if it already passed, next day
+        if cut < base:
+            cut += timedelta(days=1)
+        return cut
+    if "end of day" in t or "market close" in t or "eod" in t:
+        return base.replace(hour=20, minute=0, second=0, microsecond=0)
+    return None
+
+
+def sweep_expired_orders(now=None, dry_run=True):
+    """Cancel unfilled limit brackets whose PM-suggested expiry has passed.
+
+    Lists live open orders on MEXC, matches them against orders.json brackets
+    by symbol, and cancels any whose ``expiry_utc`` is in the past. Returns a
+    report dict. ``dry_run=True`` (default) only reports what WOULD be
+    cancelled; pass False to actually cancel.
+    """
+    now = now or datetime.now(timezone.utc)
+    report = {"checked": [], "expired": [], "cancelled": [], "errors": []}
+    try:
+        resp = _mexc_request("GET", "/api/v1/private/order/list/open_orders")
+        open_orders = resp.get("data") or []
+    except Exception as e:
+        report["errors"].append(f"list_open_orders: {e}")
+        return report
+    if not isinstance(open_orders, list):
+        return report
+    book = load_orders().get("orders", [])
+    for o in open_orders:
+        sym = o.get("symbol")
+        rec = next((r for r in book if r.get("mexc_symbol") == sym), None)
+        if rec is None:
+            # Not one of ours / not in the book — leave untouched.
+            report["checked"].append({"symbol": sym, "note": "not in orders.json"})
+            continue
+        expiry_utc = rec.get("expiry_utc")
+        if not expiry_utc:
+            report["checked"].append({"symbol": sym, "expiry": None,
+                                      "note": "no expiry set"})
+            continue
+        try:
+            cut = datetime.fromisoformat(expiry_utc)
+        except (TypeError, ValueError):
+            report["errors"].append(f"{sym}: bad expiry_utc {expiry_utc!r}")
+            continue
+        row = {"symbol": sym, "expiry_utc": expiry_utc,
+               "now": now.isoformat(), "expired": cut < now}
+        report["checked"].append(row)
+        if cut < now:
+            report["expired"].append(row)
+            if not dry_run:
+                try:
+                    cancel_order(sym)
+                    row["cancelled"] = True
+                    report["cancelled"].append(sym)
+                except Exception as e:
+                    row["cancelled"] = False
+                    report["errors"].append(f"{sym}: cancel: {e}")
+    return report
 
 
 def save_orders(data):

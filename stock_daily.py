@@ -150,7 +150,8 @@ def stage_from_verdict(res):
     from mexc_orders import build_bracket
     return build_bracket(ticker, side, entry, tp, sl,
                          equity_usd=_live_equity_usd(), risk_pct=RISK_PCT,
-                         execution=params.get("execution", "limit"))
+                         execution=params.get("execution", "limit"),
+                         expiry=params.get("expiry"))
 
 
 def _portal_healthy(timeout=20):
@@ -191,6 +192,15 @@ def preopen(date, test=False, execute=False):
         print("⚠️ ta-shadow pre-open SKIPPED: LLM provider (OpenRouter) unresponsive. "
               "No orders staged. Will retry next scheduled run.")
         return 2
+    # No hanging orders: cancel unfilled brackets from prior runs before a
+    # fresh preopen (operator directive 2026-08-24). Positions + attached
+    # TP/SL are untouched — this only clears resting entry orders.
+    if execute:
+        try:
+            from mexc_orders import cancel_leftover_brackets
+            cancel_leftover_brackets()
+        except Exception as e:
+            print(f"⚠️ leftover-bracket cleanup skipped: {e}")
     results = run_ta_parallel(date, test=test)
     staged = []
     for res in results:
