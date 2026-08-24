@@ -246,7 +246,7 @@ def parse_trade_params(text, close):
     # expiry / invalidation cutoff for limit orders (spec: no hanging GTC)
     em = re.search(
         r"(?:order[\s-]?expiry|expiry|expire(?:s|d)?|invalidat(?:e|ion)?|valid(?: until| for))"
-        r"[*:\s]*([^.]+)", text, re.IGNORECASE)
+        r"[*:\s]*([^\n*]+)", text, re.IGNORECASE)
     if em:
         raw = em.group(1).strip().strip('"\'`')
         raw = re.sub(r"\s+", " ", raw)
@@ -347,8 +347,12 @@ def main():
     pm_text = state.get("final_trade_decision") or decision or ""
     thesis = thesis_from_decision(str(pm_text))
 
-    verdict, confidence = parse_verdict(decision)
-    params = parse_trade_params(decision, close)
+    # Parse from the FULL PM decision text, not the label-only `decision`
+    # (propagate() returns process_signal(final_trade_decision) = just the
+    # rating). Parsing the label means entry/TP/SL/execution/expiry are never
+    # read from the agents' structured output. Fixed 2026-08-24.
+    verdict, confidence = parse_verdict(str(pm_text) or decision)
+    params = parse_trade_params(str(pm_text) or decision, close)
     # Deterministic post-verdict validation (spec §10): fail-closed to HOLD.
     from verdict_validator import validate_verdict
     vres = validate_verdict(verdict, params, snap, role_llms=ROLE_LLMS)
