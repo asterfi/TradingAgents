@@ -9,6 +9,7 @@
 results/
 stock-log.jsonl
 orders.json
+day-capital.json
 atr_cache.json
 hq/
 

@@ -32,10 +32,32 @@ LOG = os.path.join(LANE, "stock-log.jsonl")
 TICKERS = ["NVDA", "TSLA", "AAPL", "AMD", "SPY"]
 EQUITY_USD = 37.5  # fallback; refreshed from MEXC live balance at placement
 RISK_PCT = 0.05  # operator-set 2026-08-24: 5% of equity per trade (was 2.6%)
+DAY_CAPITAL_FILE = os.path.join(LANE, "day-capital.json")
 
 
-def _live_equity_usd():
-    """Pull current USDT equity from MEXC; fall back to 37.5 on any failure."""
+def _load_day_capital():
+    """Return the persisted day-start capital dict, or None."""
+    if os.path.exists(DAY_CAPITAL_FILE):
+        try:
+            return json.load(open(DAY_CAPITAL_FILE))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _day_start_capital(date=None):
+    """Fixed capital base for the day: first equity read is snapshotted and
+    reused for every trade that day (operator directive 2026-08-24: 5% of
+    STARTING capital per trade, not floating equity).
+
+    If no snapshot exists for the date, capture the live USDT equity now and
+    persist it; all brackets placed that day risk risk_pct of THIS number.
+    """
+    date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    snap = _load_day_capital()
+    if snap and snap.get("date") == date and snap.get("equity"):
+        return float(snap["equity"])
+    # first read of the day: snapshot live equity
     try:
         from mexc_orders import _mexc_request
         r = _mexc_request("GET", "/api/v1/private/account/assets", {})
@@ -43,10 +65,19 @@ def _live_equity_usd():
             if a.get("currency") == "USDT":
                 eq = float(a.get("equity") or 0)
                 if eq > 0:
+                    tmp = DAY_CAPITAL_FILE + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump({"date": date, "equity": eq}, f)
+                    os.replace(tmp, DAY_CAPITAL_FILE)
                     return eq
     except Exception:
         pass
     return EQUITY_USD
+
+
+def _live_equity_usd():
+    """Day-start capital (fixed base for all trades that day)."""
+    return _day_start_capital()
 
 
 def now_iso():
@@ -233,6 +264,7 @@ def preopen(date, test=False, execute=False):
     lines = [
         "🚀 *TA-SHADOW PRE-OPEN* — " + date,
         "🤖 TradingAgents due diligence · 5 stocks",
+        f"💰 Day capital: ${_live_equity_usd():.0f} · 5% risk = **${round(_live_equity_usd()*0.05, 2):.2f}** each",
         "",
     ]
     for r in results:
