@@ -170,7 +170,7 @@ def build_bracket(ticker, side, entry, take_profit, stop_loss,
     }
 
 
-def place_bracket(payload, dry_run=True):
+def place_bracket(payload, dry_run=True, now=None):
     """Place one bracket order on MEXC (dry_run=True = build only, no send).
 
     Live path is gated by the deterministic admission governor (2026-08-25
@@ -197,11 +197,18 @@ def place_bracket(payload, dry_run=True):
     if not dec["accepted"]:
         return {"admission_rejected": True, "admission": dec}
 
-    # live-price guard: validate SL/entry against the fresh executable quote
-    # for BOTH market and limit entries (Codex §execution: validate entry and
+    # live-quote guard: validate SL/entry/TP against the fresh executable
+    # quote for BOTH market and limit entries (Codex §execution: validate entry and
     # TP too, and a probe failure BLOCKS the order — never blind placement).
+    # Pre-open lane: the executable side is the best ask for a LONG and the
+    # best bid for a SHORT (brief §5 item 5); quote age is recorded.
     try:
-        mark = get_mark_price(mexc)
+        q = executable_price(mexc, payload["side"], now=now)
+        mark = q["price"]
+        payload["quote_ts"] = q.get("ts")
+        payload["quote_age_s"] = q.get("age_s")
+        if q.get("age_s") is not None and q["age_s"] > 60:
+            return {"probe_failed": True, "reason": f"quote stale ({q['age_s']:.0f}s old)"}
         sl = float(payload["stop_loss"])
         tp = float(payload["take_profit"])
         entry_ref = float(payload.get("entry") or mark)
@@ -348,6 +355,84 @@ def cancel_leftover_brackets():
     return cancelled
 
 
+def cancel_order_by_id(mexc_symbol, order_id):
+    """Cancel ONE entry order by its id (2026-08-26 pre-open lane).
+
+    Never cancel_all: unfilled-entry cancellation at 09:29 ET must be
+    surgical (brief §9). MEXC's single-cancel endpoint is
+    /api/v1/private/order/cancel with orderIds — historically flaky
+    (600 Parameter error 2026-08-24), so on failure we VERIFY the order's
+    live state before declaring failure: a transient error must never be
+    read as "cancelled" (brief §9: reconcile, do not assume).
+    """
+    body = {"symbol": mexc_symbol, "orderIds": str(order_id)}
+    try:
+        resp = _mexc_request("POST", "/api/v1/private/order/cancel", body=body)
+        if resp.get("success"):
+            return {"cancelled": True, "order_id": order_id}
+    except Exception as e:
+        pass  # fall through to verification below
+    # reconcile: is the order actually still open?
+    still_open = _order_is_open(mexc_symbol, order_id)
+    if still_open is None:
+        return {"cancelled": False, "order_id": order_id,
+                "reason": "cancel_unconfirmed", "reconcile": "state_unknown"}
+    return {"cancelled": not still_open, "order_id": order_id,
+            "reconcile": "verified_open" if still_open else "verified_closed"}
+
+
+def _order_is_open(mexc_symbol, order_id):
+    """True/False whether the entry order is still resting; None = unknown."""
+    try:
+        resp = _mexc_request("GET", "/api/v1/private/order/list/open_orders",
+                             params={"symbol": mexc_symbol, "page_num": 1, "page_size": 100})
+        orders = resp.get("data") or []
+        for o in orders:
+            if str(o.get("orderId")) == str(order_id):
+                return True
+        return False
+    except Exception:
+        return None
+
+
+def cancel_unfilled_entries(date, now=None):
+    """09:29 ET: cancel entry orders from THIS run that remain unfilled.
+
+    Pre-open lane rule (brief §9): an unfilled pre-open entry must not
+    survive into the regular session. Surgical by order id — TP/SL
+    protection and filled positions are never touched. A filled entry is
+    reported as `filled` and its position + bracket stay active per the
+    trade plan.
+    """
+    now = now or datetime.now(timezone.utc)
+    report = {"cancelled": [], "filled": [], "unconfirmed": [], "errors": []}
+    data = load_orders()
+    if data.get("date") != date:
+        report["errors"].append(f"orders.json date {data.get('date')} != {date}")
+        return report
+    for o in data.get("orders", []):
+        oid = o.get("order_id")
+        sym = o.get("mexc_symbol")
+        if o.get("status") != "placed" or not oid or not sym:
+            continue
+        open_state = _order_is_open(sym, oid)
+        if open_state is False:
+            # no longer resting: either filled (position exists) or already gone
+            report["filled"].append({"ticker": o.get("ticker"), "order_id": oid})
+            o["status"] = "filled_or_closed"
+            continue
+        res = cancel_order_by_id(sym, oid)
+        if res.get("cancelled"):
+            report["cancelled"].append({"ticker": o.get("ticker"), "order_id": oid})
+            o["status"] = "cancelled_unfilled"
+        else:
+            report["unconfirmed"].append({"ticker": o.get("ticker"), "order_id": oid,
+                                          "reason": res.get("reason") or res.get("reconcile")})
+            o["status"] = "cancel_unconfirmed"
+    save_orders(data)
+    return report
+
+
 def load_orders():
     if os.path.exists(ORDER_FILE):
         try:
@@ -438,6 +523,48 @@ def get_mark_price(symbol):
     if not d.get("success"):
         raise RuntimeError(f"ticker failed for {symbol}: {d.get('message')}")
     return float(d["data"]["lastPrice"])
+
+
+def refresh_quote(symbol, now=None):
+    """Fresh executable quote with timestamp + age (brief §5 items 4-7).
+
+    Returns {price, bid, ask, spread, ts, age_s}. price is the best ask for
+    a LONG entry and the best bid for a SHORT (the executable side); the
+    caller picks by side via `bid_or_ask`. Falls back to lastPrice when the
+    depth book is empty. Records the quote timestamp and age so stale
+    quotes can be rejected deterministically.
+    """
+    now = now or datetime.now(timezone.utc)
+    url = f"{BASE_URL}/api/v1/contract/depth?symbol={symbol}&limit=5"
+    req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        d = json.loads(r.read().decode())
+    if not d.get("success"):
+        raise RuntimeError(f"depth failed for {symbol}: {d.get('message')}")
+    book = d.get("data") or {}
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    bid = float(bids[0][0]) if bids else None
+    ask = float(asks[0][0]) if asks else None
+    if bid is None or ask is None:
+        # empty book (pre-open on some contracts): fall back to last trade
+        px = get_mark_price(symbol)
+        bid = ask = px
+    ts = now.timestamp()
+    return {
+        "bid": bid, "ask": ask,
+        "spread": (ask - bid) if (bid and ask) else 0.0,
+        "ts": ts, "age_s": 0.0,
+        "bid_or_ask": {"LONG": ask, "SHORT": bid},
+        "price": None,  # caller resolves side below
+    }
+
+
+def executable_price(symbol, side, now=None):
+    """Best ask for a LONG, best bid for a SHORT (brief §5 item 5)."""
+    q = refresh_quote(symbol, now=now)
+    q["price"] = q["bid_or_ask"][side]
+    return q
 
 
 def sweep_stale_brackets(now=None, dry_run=True):

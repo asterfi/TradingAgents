@@ -21,9 +21,10 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 LANE = os.path.dirname(os.path.abspath(__file__))
+STRATEGY_VERSION = "ta-shadow/ny-preopen-1"  # stamped on every staged decision
 VENV_PY = os.path.join(LANE, ".venv", "bin", "python")
 RUN_STOCK = os.path.join(LANE, "run_stock.py")
 SCREEN = os.path.join(LANE, "nyopen_screen.py")
@@ -250,17 +251,25 @@ def preopen(date, test=False, execute=False, dry=False):
     lock = _acquire_singleton_lock("preopen")
     if lock is None:
         return 3
-    # --- execution timing (Codex §"Execution and timing") ----------------
-    # The 12:00 UTC analysis is pre-open: decisions are STAGED, never
-    # executed against the prior day's close. Market entries execute only
-    # in the NYSE-open window (sweep/executor phase) with a fresh quote.
-    if execute and not dry:
-        import nyse_calendar
-        if not nyse_calendar.in_open_window():
-            nxt = nyse_calendar.next_open_utc()
-            print(f"⛔ execution refused: outside the NYSE-open window "
-                  f"(next open {nxt.isoformat()}). Decisions remain staged.")
+    # --- NY pre-open lane (2026-08-26 restructure) ------------------------
+    # Analysis runs 08:00-09:00 ET on a trading day; decisions stage but
+    # NEVER execute during this phase (brief §4: no placement during
+    # analysis/staging). Execution is the separate 09:20 ET executor phase.
+    import nyse_calendar as nyc
+    if not test and not dry:
+        if not nyc.is_trading_day(nyc._et_today()[0]):
+            print(f"⛔ preopen refused: {nyc.et_date_str()} is not an NYSE trading day")
             return 4
+        if not nyc.in_analysis_window():
+            print(f"⛔ preopen refused: outside the 08:00-09:00 ET analysis window "
+                  f"(staging deadline {nyc.staging_deadline_et().isoformat()})")
+            return 4
+    # 09:15 staging deadline: a late graph result can never stage (brief §4)
+    stage_deadline_passed = nyc.past_staging_deadline()
+    if execute and not dry and not test:
+        print("⛔ preopen: execution is not part of this phase anymore — "
+              "staged decisions execute at 09:20 ET via --execute-staged")
+        return 4
     if not test and not dry and not _portal_healthy():
         print("⚠️ ta-shadow pre-open SKIPPED: LLM provider (OpenRouter) unresponsive. "
               "No orders staged. Will retry next scheduled run.")
@@ -268,7 +277,7 @@ def preopen(date, test=False, execute=False, dry=False):
     # No hanging orders: cancel unfilled brackets from prior runs before a
     # fresh preopen (operator directive 2026-08-24). Positions + attached
     # TP/SL are untouched — this only clears resting entry orders.
-    if execute:
+    if not test and not dry:
         try:
             from mexc_orders import cancel_leftover_brackets
             cancel_leftover_brackets()
@@ -276,9 +285,25 @@ def preopen(date, test=False, execute=False, dry=False):
             print(f"⚠️ leftover-bracket cleanup skipped: {e}")
     results = run_ta_parallel(date, test=test)
     staged = []
+    skipped_late = []
     for res in results:
+        if res.get("error"):
+            # timed-out/errored ticker: ineligible for this session (brief §4)
+            skipped_late.append((res.get("ticker"), "analysis_incomplete"))
+            continue
+        if stage_deadline_passed and not test and not dry:
+            # arrived after 09:15 ET: never eligible, not retroactively (§4)
+            skipped_late.append((res.get("ticker"), "analysis_deadline_exceeded"))
+            continue
         br = stage_from_verdict(res)
         if br:
+            # staged-decision metadata (brief §4): ticker, trade date,
+            # strategy version, analysis completion + expiry
+            br["trade_date"] = date
+            br["strategy_version"] = STRATEGY_VERSION
+            br["analysis_completed_at"] = now_iso()
+            br["expires_at"] = (nyc.staging_deadline_et()
+                                + timedelta(minutes=5)).astimezone(timezone.utc).isoformat()
             staged.append(br)
     # persist orders (only non-test)
     if not test:
@@ -288,35 +313,6 @@ def preopen(date, test=False, execute=False, dry=False):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=1)
         os.replace(tmp, ORDERS)
-    if execute and not test:
-        from mexc_orders import place_bracket
-        for br in staged:
-            try:
-                resp = place_bracket(br, dry_run=dry)  # dry=True: build only, no send
-                if isinstance(resp, dict) and resp.get("invalidated"):
-                    br["status"] = "invalidated"
-                    br["reason"] = resp.get("reason")
-                elif isinstance(resp, dict) and resp.get("probe_failed"):
-                    br["status"] = "probe_failed"
-                    br["reason"] = resp.get("reason")
-                elif isinstance(resp, dict) and resp.get("admission_rejected"):
-                    br["status"] = f"admission_{resp['admission']['decision']}"
-                    br["reason"] = resp["admission"].get("detail", {}).get("error") or \
-                        resp["admission"]["decision"]
-                else:
-                    br["status"] = "dry_placed" if dry else "placed"
-                    br["order_id"] = resp.get("data", {}).get("orderId")
-            except Exception as e:
-                br["status"] = f"error: {str(e)[:150]}"
-        failed = [b for b in staged if b.get("status", "").startswith(("error", "admission_", "probe_failed"))]
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=1)
-        os.replace(tmp, ORDERS)
-        # partial failure visibility (Codex §orchestration item 5): any
-        # placement failure must be loud in the digest, not silently swallowed
-        if failed:
-            print("⚠️ PLACEMENT FAILURES: " + ", ".join(
-                f"{b.get('ticker')} [{b.get('status')}]" for b in failed))
     # summary — polished per-asset due-diligence digest for Telegram
     verdict_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪", "UNKNOWN": "⚫"}
     vcount = {"BUY": 0, "SELL": 0, "HOLD": 0, "UNKNOWN": 0}
@@ -361,28 +357,11 @@ def preopen(date, test=False, execute=False, dry=False):
     lines.append(f"📊 Verdicts: 🟢{vcount['BUY']} · 🔴{vcount['SELL']} · ⚪{vcount['HOLD']}")
     if staged:
         placed = sum(1 for b in staged if b.get("status") == "placed")
-        dry_placed = sum(1 for b in staged if b.get("status") == "dry_placed")
-        if dry and execute:
-            # dry run: brackets built but NOT sent to MEXC
-            lines.append(f"🧪 *DRY RUN* — {len(staged)} bracket(s) built, {dry_placed} validated, NOT placed on MEXC")
-            lines.append(f"   (no live orders sent — dry mode)")
-        elif execute:
-            lines.append(f"🎯 *{placed}/{len(staged)} bracket orders PLACED LIVE*")
-            invalidated = [b.get("ticker") for b in staged if b.get("status") == "invalidated"]
-            admitted_skip = [(b.get("ticker"), b.get("status")) for b in staged
-                             if str(b.get("status", "")).startswith("admission_")]
-            failed = [b.get("ticker") for b in staged
-                      if b.get("status") not in ("placed", "invalidated")
-                      and not str(b.get("status", "")).startswith("admission_")]
-            if invalidated:
-                lines.append(f"   ⚪ skipped (price already past SL): {', '.join(invalidated)}")
-            for tk, st in admitted_skip:
-                # admission governor decision, machine-readable reason
-                lines.append(f"   ⛔ {tk}: skipped — governor [{st[len('admission_'):]}]")
-            if failed:
-                lines.append(f"   ⚠️ failed: {', '.join(failed)}")
-        else:
-            lines.append(f"🎯 {len(staged)} bracket(s) staged — review before execute")
+        if skipped_late:
+            for tk, why in skipped_late:
+                lines.append(f"   ⛔ {tk}: not staged — {why}")
+        if staged:
+            lines.append(f"🎯 {len(staged)} decision(s) staged for the 09:20 ET executor")
     else:
         lines.append("🎯 No brackets (no validated BUY/SELL).")
     # total run cost
@@ -393,59 +372,195 @@ def preopen(date, test=False, execute=False, dry=False):
     return 0
 
 
-def execute_staged(date):
-    """Post-open execution phase (Codex §"Execution and timing").
+def execute_staged(date, now=None):
+    """09:20 ET pre-open executor (2026-08-26 NY pre-open restructure).
 
-    Runs INSIDE the NYSE-open window: re-reads today's staged orders and
-    places each one with a fresh executable quote (place_bracket re-fetches
-    live state, re-validates SL/entry/TP, re-runs the admission governor).
-    Staged market entries become live market orders here; limit entries rest.
+    Deterministic fresh-quote revalidation + IMMEDIATE placement — NOT a
+    second LLM analysis (brief §5). Per order, before submission:
+    reconcile live MEXC state (fail closed), load only completed
+    current-date staged decisions created before the 09:15 deadline, take a
+    fresh executable quote (best ask for longs, best bid for shorts),
+    sanity-check it, re-run all governor checks, recompute quantity/risk at
+    the executable price, re-check geometry + 1R + drift, then place
+    immediately. Ranking (brief §7) picks the best candidates when there
+    are more signals than slots. Entry cutoff 09:25 ET.
     """
     lock = _acquire_singleton_lock("execute")
     if lock is None:
         return 3
-    import nyse_calendar
-    if not nyse_calendar.in_open_window():
-        print(f"⛔ execute_staged refused: outside NYSE-open window "
-              f"(next open {nyse_calendar.next_open_utc().isoformat()})")
+    import nyse_calendar as nyc
+    now = now or datetime.now(timezone.utc)
+    if not nyc.is_trading_day(nyc._et_today(now)[0]):
+        print(f"⛔ executor refused: {nyc.et_date_str(now)} is not an NYSE trading day")
         return 4
-    from mexc_orders import load_orders, place_bracket, save_orders
+    if not nyc.in_exec_window(now):
+        print("⛔ executor refused: outside the 09:20-09:25 ET execution window "
+              f"(staging deadline was {nyc.staging_deadline_et(now).isoformat()})")
+        return 4
+    from mexc_orders import load_orders, place_bracket, save_orders, refresh_quote
     data = load_orders()
-    if data.get("date") != date:
-        print(f"⛔ no staged orders for {date} (orders.json date: {data.get('date')})")
+    # staged decisions are valid only for the associated NYSE trading date
+    # and must have been created before the 09:15 ET deadline (brief §4/§10)
+    today_et = nyc.et_date_str(now)
+    if data.get("date") != date or date != today_et:
+        print(f"⛔ no current-date staged orders for {today_et} "
+              f"(orders.json date: {data.get('date')}, arg date: {date})")
         return 5
-    staged = [o for o in data.get("orders", []) if o.get("status") == "staged"]
-    if not staged:
-        print("no staged orders to execute")
+    deadline = nyc.staging_deadline_et(now)
+    candidates = []
+    for o in data.get("orders", []):
+        if o.get("status") != "staged":
+            continue
+        created = o.get("analysis_completed_at")
+        if created and _parse_iso(created) and _parse_iso(created) > deadline:
+            o["status"] = "rejected"; o["reason"] = "analysis_deadline_exceeded"
+            continue
+        if o.get("trade_date") and o.get("trade_date") != today_et:
+            o["status"] = "rejected"; o["reason"] = "stage_expired"
+            continue
+        candidates.append(o)
+    if not candidates:
+        print("no eligible staged orders to execute")
+        save_orders(data)
         return 0
-    for br in staged:
+
+    # --- deterministic ranking (brief §7) ------------------------------
+    # Never ticker-list order / completion order / dict order. Rank by
+    # validator quality, refreshed reward-to-risk, adverse entry drift,
+    # spread/slippage — with ticker symbol as the FINAL tie-breaker only.
+    ranked, rejections = _rank_candidates(candidates, now)
+    slots, slot_reason = _available_slots()
+    admitted = ranked[:slots] if slots > 0 else []
+    skip_note = (f"{len(ranked)} eligible, {slots} slots, admitted "
+                 f"{[a['ticker'] for a in admitted]}")
+    print(skip_note)
+    placed_any = False
+    for br in admitted:
+        # 09:25 entry cutoff: check the clock immediately before submitting
+        if not nyc.in_exec_window(datetime.now(timezone.utc)):
+            br["status"] = "rejected"; br["reason"] = "entry_cutoff"
+            continue
         try:
-            resp = place_bracket(br, dry_run=False)
-            if isinstance(resp, dict) and resp.get("invalidated"):
-                br["status"] = "invalidated"; br["reason"] = resp.get("reason")
-            elif isinstance(resp, dict) and resp.get("probe_failed"):
-                br["status"] = "probe_failed"; br["reason"] = resp.get("reason")
-            elif isinstance(resp, dict) and resp.get("admission_rejected"):
-                br["status"] = f"admission_{resp['admission']['decision']}"
-            elif isinstance(resp, dict) and resp.get("duplicate_suppressed"):
-                br["status"] = f"duplicate_suppressed_{resp.get('last_state')}"
-            else:
-                br["status"] = "placed"
-                br["order_id"] = resp.get("data", {}).get("orderId")
-                if isinstance(resp, dict) and resp.get("protection_failed"):
-                    br["status"] = "PROTECTION_FAILED"
-                    br["reason"] = (resp.get("protection") or {}).get("reason")
+            resp = place_bracket(br, dry_run=False, now=now)
+            placed_any = True
+            _apply_placement_result(br, resp)
         except Exception as e:
             br["status"] = f"error: {str(e)[:150]}"
+    # lower-ranked candidates that did not fit the slots (brief §7)
+    for br in ranked[slots:]:
+        br["status"] = "rejected"; br["reason"] = "lower_ranked_than_available_slots"
+    for br, why in rejections:
+        br["status"] = "rejected"; br["reason"] = why
     save_orders(data)
-    failed = [b for b in staged if str(b.get("status", "")).startswith(("error", "admission_", "probe_failed", "PROTECTION_FAILED"))]
-    print(json.dumps({k: b.get(k) for b in staged
-                      for k in ("ticker", "status")}, default=str))
+    for br in candidates:
+        print(f"  {br.get('ticker')}: {br.get('status')} "
+              f"({br.get('reason') or 'ok'})")
+    failed = [b for b in candidates if str(b.get("status", "")).startswith(
+        ("error", "admission_", "probe_failed", "PROTECTION_FAILED"))]
     if failed:
         print("⚠️ EXECUTION FAILURES: " + ", ".join(
             f"{b.get('ticker')} [{b.get('status')}]" for b in failed))
         return 2
     return 0
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_placement_result(br, resp):
+    if isinstance(resp, dict) and resp.get("invalidated"):
+        br["status"] = "rejected"; br["reason"] = resp.get("reason", "invalidated")
+    elif isinstance(resp, dict) and resp.get("probe_failed"):
+        br["status"] = "rejected"; br["reason"] = "quote_unavailable"
+    elif isinstance(resp, dict) and resp.get("admission_rejected"):
+        br["status"] = "rejected"
+        br["reason"] = (resp.get("admission") or {}).get("decision", "admission_rejected")
+    elif isinstance(resp, dict) and resp.get("duplicate_suppressed"):
+        br["status"] = "rejected"; br["reason"] = "duplicate_order"
+    else:
+        br["status"] = "placed"
+        br["order_id"] = resp.get("data", {}).get("orderId")
+        if isinstance(resp, dict) and resp.get("protection_failed"):
+            br["status"] = "rejected"
+            br["reason"] = "protection_unconfirmed"
+            br["detail"] = (resp.get("protection") or {}).get("reason")
+
+
+def _available_slots():
+    """Position slots under the 3-cap AFTER existing positions + pending
+    entries consume theirs (brief §7). Fail closed on unknown state."""
+    import admission
+    try:
+        state = admission.fetch_live_state()
+    except admission.LiveStateError as e:
+        return 0, f"state_unknown: {e}"
+    n_open = len(state["positions"]) + len([1 for v in state["orders"].values() if v])
+    return max(0, 3 - n_open), f"open={n_open}"
+
+
+def _rank_candidates(candidates, now):
+    """Deterministic ranking with machine-readable pre-rejections.
+
+    Refreshed reward-to-risk uses the live quote (already fetched for
+    ranking); adverse drift compares the executable price with the PM's
+    planned entry. Ticker symbol is the final stable tie-breaker.
+    """
+    import nyse_calendar as nyc
+    from mexc_orders import refresh_quote as _refresh_quote
+    ranked, rejections = [], []
+    for br in candidates:
+        ticker = br["ticker"]
+        side = br["side"]
+        try:
+            q = _refresh_quote(br["mexc_symbol"])
+        except Exception:
+            rejections.append((br, "quote_unavailable"))
+            continue
+        px = q["bid_or_ask"][side] if q.get("bid_or_ask") else q.get("price")
+        if px is None:
+            rejections.append((br, "quote_unavailable")); continue
+        if q.get("age_s") is not None and q["age_s"] > 60:
+            rejections.append((br, "quote_stale")); continue
+        entry = float(br["entry"]); tp = float(br["take_profit"]); sl = float(br["stop_loss"])
+        # stop already breached / target already reached first — the specific
+        # reason must win over generic geometry (brief §6 reason codes)
+        if (side == "LONG" and px <= sl) or (side == "SHORT" and px >= sl):
+            rejections.append((br, "stop_already_breached")); continue
+        if (side == "LONG" and px >= tp) or (side == "SHORT" and px <= tp):
+            rejections.append((br, "target_already_reached")); continue
+        # geometry at the executable quote (brief §5 items 13/14)
+        if side == "LONG" and not (sl < px < tp):
+            rejections.append((br, "invalid_trade_geometry")); continue
+        if side == "SHORT" and not (tp < px < sl):
+            rejections.append((br, "invalid_trade_geometry")); continue
+        # entry drift: setup invalidated if price ran past the plan (§5 item 16)
+        drift = (px - entry) / entry
+        if side == "LONG" and drift > 0.01:
+            rejections.append((br, "entry_drift_exceeded")); continue
+        if side == "SHORT" and -drift > 0.01:
+            rejections.append((br, "entry_drift_exceeded")); continue
+        # refreshed reward-to-risk at the executable entry (§5 item 15)
+        rr = (tp - px) / (px - sl) if side == "LONG" else (px - tp) / (sl - px)
+        if rr < 1.0:
+            rejections.append((br, "rr_below_floor")); continue
+        # spread/slippage proxy: |quote vs PM entry| is the fill risk
+        spread = q.get("spread") or 0.0
+        if spread and spread > 0.005 * px:
+            rejections.append((br, "spread_exceeded")); continue
+        # validator quality (from the staged record: validation reasons empty)
+        quality = 0 if br.get("validation_reasons") else 1
+        ranked.append({
+            "br": br, "rr": rr, "drift": abs(drift), "spread": spread,
+            "quality": quality, "ticker": ticker,
+        })
+    # deterministic ordering: quality desc, rr desc, drift asc, spread asc,
+    # ticker asc as the final stable tie-breaker (brief §7)
+    ranked.sort(key=lambda r: (-r["quality"], -r["rr"], r["drift"], r["spread"], r["ticker"]))
+    return [r["br"] for r in ranked], rejections
 
 
 def screen_phase(test=False):
@@ -463,7 +578,11 @@ def main():
     ap.add_argument("--sweep", action="store_true",
                     help="cancel stale unfilled brackets (post-open cleanup + price invalidation)")
     ap.add_argument("--execute-staged", action="store_true",
-                    help="post-open phase: place today's staged orders inside the NYSE-open window")
+                    help="09:20 ET pre-open executor: deterministic fresh-quote "
+                         "revalidation + immediate placement (cutoff 09:25 ET)")
+    ap.add_argument("--cancel-entries", action="store_true",
+                    help="09:29 ET: cancel unfilled entry orders from today's run "
+                         "(surgical by order id; positions/TP/SL untouched)")
     ap.add_argument("--date", default=None)
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--execute", action="store_true", help="place staged orders live")
@@ -477,6 +596,21 @@ def main():
         return screen_phase(test=args.test)
     if args.execute_staged:
         return execute_staged(date)
+    if args.cancel_entries:
+        lock = _acquire_singleton_lock("cancel")
+        if lock is None:
+            return 3
+        import nyse_calendar as nyc
+        now = datetime.now(timezone.utc)
+        if not nyc.in_cancel_window(now):
+            print("⛔ cancel-entries refused: outside the 09:29-09:35 ET window")
+            return 4
+        from mexc_orders import cancel_unfilled_entries
+        rep = cancel_unfilled_entries(nyc.et_date_str(now), now=now)
+        print(json.dumps(rep, default=str))
+        if rep["unconfirmed"] or rep["errors"]:
+            return 2
+        return 0
     if args.sweep:
         lock = _acquire_singleton_lock("sweep")
         if lock is None:

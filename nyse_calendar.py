@@ -86,6 +86,96 @@ def in_open_window(now: datetime | None = None, minutes_after_open: int = 45) ->
     return o <= now <= o + timedelta(minutes=minutes_after_open)
 
 
+# --- NY pre-open lane windows (2026-08-25/26 restructure) -------------------
+# All times America/New_York on a TRADING day:
+#   08:00  analysis start (5 tickers in parallel)
+#   09:00  worst-case end (existing 3600s per-ticker timeout)
+#   09:15  hard staging deadline — later arrivals never become eligible
+#   09:20  executor: deterministic fresh-quote revalidation + placement
+#   09:25  entry cutoff — no new entries initiated after this
+#   09:29  cancel unfilled entry orders from this run
+#   09:30  NYSE core session open
+PREOPEN_ANALYSIS_START = time(8, 0)
+PREOPEN_ANALYSIS_END = time(9, 0)      # worst-case timeout endpoint
+STAGE_DEADLINE = time(9, 15)
+EXEC_WINDOW_START = time(9, 20)
+ENTRY_CUTOFF = time(9, 25)
+ENTRY_CANCEL = time(9, 29)
+
+
+def _et_today(now: datetime | None = None) -> tuple[date, datetime]:
+    n = (now or now_utc()).astimezone(ET)
+    return n.date(), n
+
+
+def in_analysis_window(now: datetime | None = None) -> bool:
+    """True 08:00–09:00 ET on a trading day (late starts allowed until the
+    worst-case timeout endpoint; the 09:15 staging deadline still applies)."""
+    d, n = _et_today(now)
+    if not is_trading_day(d):
+        return False
+    s = datetime.combine(d, PREOPEN_ANALYSIS_START, tzinfo=ET)
+    e = datetime.combine(d, PREOPEN_ANALYSIS_END, tzinfo=ET)
+    return s <= n <= e
+
+
+def staging_deadline_et(now: datetime | None = None) -> datetime:
+    """The 09:15 ET staging deadline for the current/next trading day."""
+    d, n = _et_today(now)
+    for _ in range(8):
+        if is_trading_day(d):
+            dl = datetime.combine(d, STAGE_DEADLINE, tzinfo=ET)
+            if dl > n:
+                return dl
+        d += timedelta(days=1)
+    raise RuntimeError("no trading day found within a week")
+
+
+def past_staging_deadline(now: datetime | None = None) -> bool:
+    d, n = _et_today(now)
+    if not is_trading_day(d):
+        return True
+    dl = datetime.combine(d, STAGE_DEADLINE, tzinfo=ET)
+    return n > dl
+
+
+def in_exec_window(now: datetime | None = None) -> bool:
+    """True 09:20–09:25 ET on a trading day — the only window in which the
+    pre-open executor may initiate entries (item 5 §brief: place immediately
+    after revalidation; 09:25 is the hard entry cutoff)."""
+    d, n = _et_today(now)
+    if not is_trading_day(d):
+        return False
+    s = datetime.combine(d, EXEC_WINDOW_START, tzinfo=ET)
+    e = datetime.combine(d, ENTRY_CUTOFF, tzinfo=ET)
+    return s <= n <= e
+
+
+def at_or_past_entry_cancel(now: datetime | None = None) -> bool:
+    """True >= 09:29 ET on a trading day — unfilled entries get cancelled."""
+    d, n = _et_today(now)
+    if not is_trading_day(d):
+        return False
+    c = datetime.combine(d, ENTRY_CANCEL, tzinfo=ET)
+    return n >= c
+
+
+def in_cancel_window(now: datetime | None = None) -> bool:
+    """09:29–09:35 ET: cancel unfilled entries, reconcile, never open new."""
+    d, n = _et_today(now)
+    if not is_trading_day(d):
+        return False
+    c = datetime.combine(d, ENTRY_CANCEL, tzinfo=ET)
+    end = datetime.combine(d, time(9, 35), tzinfo=ET)
+    return c <= n <= end
+
+
+def et_date_str(now: datetime | None = None) -> str:
+    """The NYSE trading date (YYYY-MM-DD) a pre-open run belongs to."""
+    d, _ = _et_today(now)
+    return d.isoformat()
+
+
 def sweep_time_utc(now: datetime | None = None, minutes_after_open: int = 90) -> datetime:
     """The correct sweep time: open + N minutes (default 90) on the CURRENT
     or NEXT trading day, in UTC. A cron started at a fixed UTC hour can
