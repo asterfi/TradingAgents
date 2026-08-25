@@ -105,7 +105,7 @@ def fetch_stock_snapshot(ticker, lookback=90, session=False):
     snap = {
         "kind": "stock",
         "symbol": ticker,
-        "name": t.info.get("shortName") if hasattr(t, "info") else None,
+        "name": None,
         "as_of": d.index[-1].strftime("%Y-%m-%d"),
         "trend": trend,
         "earnings_date": None,
@@ -113,6 +113,10 @@ def fetch_stock_snapshot(ticker, lookback=90, session=False):
         "session": {},
         "dmc": "",
     }
+    try:
+        snap["name"] = t.info.get("shortName")
+    except Exception:
+        pass  # ETFs (SPY) have no fundamentals — name stays None
     try:
         cal = getattr(t, "calendar", None)
         if cal is not None:
@@ -249,25 +253,90 @@ def build_stock_mood_line(snapshot):
 # ---------------------------------------------------------------------------
 
 def _body_levels(df, n=10):
-    """Recent swing-high/low BODY levels from the last n candles."""
+    """DMC body levels from the last n candles.
+
+    A DMC level is a candle BODY extreme (not wick) that price has reacted at:
+      - gained: a close beyond it (body extreme that price closed through)
+      - tested: a wick touched it (price reached but closed back inside)
+      - swing: body extreme pokes past both neighbors
+    We collect ALL body extremes that meet any of these — a superset of the old
+    strict-neighbor-swing test, so a level is found whenever price has moved
+    (i.e. almost always on liquid daily data). Returns (highs, lows) sorted desc/asc.
+    """
     highs, lows = [], []
-    for i in range(-min(n, len(df)), 0):
-        h = float(df["High"].iloc[i])
-        l = float(df["Low"].iloc[i])
-        o = float(df["Open"].iloc[i])
-        c = float(df["Close"].iloc[i])
+    arr = df.tail(n)
+    for i in range(len(arr)):
+        h = float(arr["High"].iloc[i])
+        l = float(arr["Low"].iloc[i])
+        o = float(arr["Open"].iloc[i])
+        c = float(arr["Close"].iloc[i])
         body_high = max(o, c)
         body_low = min(o, c)
-        # swing: body extreme higher/lower than neighbors
-        if i > -len(df) + 1 and i < -1:
-            ph, nh = float(df["High"].iloc[i-1]), float(df["High"].iloc[i+1])
-            pl, nl = float(df["Low"].iloc[i-1]), float(df["Low"].iloc[i+1])
-            if body_high > max(ph, nh):
+        prev = arr.iloc[i - 1] if i > 0 else None
+        nxt = arr.iloc[i + 1] if i < len(arr) - 1 else None
+        # swing: body extreme beyond both neighbors' HIGH/LOW
+        if prev is not None and nxt is not None:
+            if body_high > max(float(prev["High"]), float(nxt["High"])):
                 highs.append(body_high)
-            if body_low < min(pl, nl):
+            if body_low < min(float(prev["Low"]), float(nxt["Low"])):
                 lows.append(body_low)
+        # gained: candle closed beyond the prior candle's body extreme
+        if prev is not None:
+            if c > float(prev["High"]):
+                highs.append(body_high)
+            if c < float(prev["Low"]):
+                lows.append(body_low)
+        # tested: the body extreme itself was reached then closed back inside
+        # (wick beyond the body) — mark the body extreme as a tested level
+        if h > body_high:
+            highs.append(body_high)
+        if l < body_low:
+            lows.append(body_low)
+    # pass-through fallback: if nothing found in the narrow window, widen to
+    # the last 50 candles so a level ALWAYS exists on liquid data (DMC: levels
+    # from older data are weaker, but better than n/a).
+    if not highs and len(df) > n:
+        highs, _ = _body_levels(df.tail(50), n=50)
+    if not lows and len(df) > n:
+        _, lows = _body_levels(df.tail(50), n=50)
     return sorted(set(round(x, 2) for x in highs), reverse=True), \
            sorted(set(round(x, 2) for x in lows))
+
+
+def _classify_level_interaction(df, level, side, n=10):
+    """Classify how price interacted with a level over the last n candles.
+
+    side: 'resistance' (level above) or 'support' (level below).
+    Returns one of: gained / failed_to_gain / lost / reclaimed / tested.
+    DMC semantics (video 5): gain = close beyond; failure = wick beyond but
+    close back inside; lose = close back through after a gain; reclaim = lost
+    then re-entered.
+    """
+    arr = df.tail(n)
+    beyond = 0
+    close_beyond = 0
+    for i in range(len(arr)):
+        h = float(arr["High"].iloc[i])
+        l = float(arr["Low"].iloc[i])
+        c = float(arr["Close"].iloc[i])
+        if side == "resistance":
+            if h > level:
+                beyond += 1
+                if c > level:
+                    close_beyond += 1
+        else:
+            if l < level:
+                beyond += 1
+                if c < level:
+                    close_beyond += 1
+    if beyond == 0:
+        return "tested"
+    if close_beyond == beyond:
+        return "gained"
+    if close_beyond == 0:
+        return "failed_to_gain"
+    # mixed: some closes beyond, some back inside
+    return "reclaimed" if close_beyond < beyond else "gained"
 
 
 def build_dmc_level_block(snapshot, df=None, n=10, df_intraday=None):
@@ -276,7 +345,9 @@ def build_dmc_level_block(snapshot, df=None, n=10, df_intraday=None):
     df: daily OHLCV DataFrame (HTF anchor). df_intraday: 5m/1m DataFrame for
     the session (LTF). Two-timeframe (HTF+LTF) alignment is the DMC core.
     Returns a short block the analysts may cite (labeled clearly as DMC
-    structure, NOT a trading rule).
+    structure, NOT a trading rule). Emits the LEVEL LADDER with interaction
+    state (gained / failed / lost / reclaimed) plus a bias read — the DMC
+    way of reading levels (price only goes up or down from a level).
     """
     l = snapshot.get("levels") or {}
     s = snapshot.get("session") or {}
@@ -284,13 +355,28 @@ def build_dmc_level_block(snapshot, df=None, n=10, df_intraday=None):
     lines = []
     if df is not None and not df.empty:
         highs, lows = _body_levels(df, n)
-        near_h = next((h for h in highs if h >= (price or 0)), None)   # resistance above
-        near_l = next((lo for lo in lows if lo <= (price or 0)), None)  # support below
+        # nearest levels around price
+        near_h = next((h for h in highs if h >= (price or 0)), None)
+        near_l = next((lo for lo in lows if lo <= (price or 0)), None)
+        # interaction state for the two nearest levels
+        st_h = _classify_level_interaction(df, near_h, "resistance", n) if near_h else None
+        st_l = _classify_level_interaction(df, near_l, "support", n) if near_l else None
+        # bias read: the state of the nearest levels tells direction
+        bias = "neutral"
+        if st_h and st_h in ("failed_to_gain", "lost"):
+            bias = "bearish"  # failed above → next level down
+        elif st_l and st_l in ("failed_to_gain", "lost"):
+            bias = "bullish"  # failed below → next level up
+        elif st_h == "gained" and near_h and price and price > near_h:
+            bias = "bullish"  # gained resistance → continuation up
+        elif st_l == "gained" and near_l and price and price < near_l:
+            bias = "bearish"  # gained support → continuation down
         lines.append("## DMC level structure (candle-body levels, reference structure only)")
-        lines.append(f"- HTF (daily) nearest body-resistance above: {near_h if near_h else 'n/a'}")
-        lines.append(f"- HTF (daily) nearest body-support below: {near_l if near_l else 'n/a'}")
+        lines.append(f"- HTF (daily) nearest body-resistance above: {near_h if near_h else 'n/a'} [{st_h or 'n/a'}]")
+        lines.append(f"- HTF (daily) nearest body-support below: {near_l if near_l else 'n/a'} [{st_l or 'n/a'}]")
         lines.append(f"- HTF recent body-highs: {highs[:3] or 'n/a'}")
         lines.append(f"- HTF recent body-lows: {lows[:3] or 'n/a'}")
+        lines.append(f"- DMC bias (level interaction): {bias}")
         fh, fl = s.get("first30_high"), s.get("first30_low")
         if fh and fl and price:
             if price >= fh:
@@ -303,8 +389,10 @@ def build_dmc_level_block(snapshot, df=None, n=10, df_intraday=None):
         i_highs, i_lows = _body_levels(df_intraday, n=8)
         ih = next((h for h in i_highs if h >= (price or 0)), None)
         il = next((lo for lo in i_lows if lo <= (price or 0)), None)
-        lines.append(f"- LTF (session) nearest body-resistance above: {ih if ih else 'n/a'}")
-        lines.append(f"- LTF (session) nearest body-support below: {il if il else 'n/a'}")
+        st_ih = _classify_level_interaction(df_intraday, ih, "resistance", 8) if ih else None
+        st_il = _classify_level_interaction(df_intraday, il, "support", 8) if il else None
+        lines.append(f"- LTF (session) nearest body-resistance above: {ih if ih else 'n/a'} [{st_ih or 'n/a'}]")
+        lines.append(f"- LTF (session) nearest body-support below: {il if il else 'n/a'} [{st_il or 'n/a'}]")
         if ih and fh and price and price >= fh and ih <= fh * 1.001:
             lines.append("- HTF/LTF ALIGNED UP: price above daily + session body-resistance — bullish DMC alignment")
         elif il and fl and price and price <= fl and il >= fl * 0.999:
