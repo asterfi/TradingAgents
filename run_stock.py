@@ -321,17 +321,15 @@ def main():
     config["llm_provider"] = PROVIDER
     config["deep_think_llm"] = DEEP_THINK_LLM
     config["quick_think_llm"] = QUICK_THINK_LLM
-    # SDK retries OFF — the openai SDK's own 4x cycle (420s timeout each) can
-    # burn ~28 min per call on a slow portal before our capacity guard ever
-    # runs. With max_retries=0 the SDK fails fast on timeout; our
-    # NousChatOpenAI.invoke capacity guard (jittered backoff, 12 attempts)
-    # handles timeouts/429s instead — it proved faster (market analyst in
-    # ~227s in the fail-fast diag vs 20+ min of SDK retries).
-    # Per-attempt timeout is generous: analyst reports can legitimately take
-    # 3-5 min on a capacity-strained portal. The guard backs off and retries
-    # within its 12-attempt budget rather than the SDK doing 4 blind retries.
-    config["llm_max_retries"] = 0
-    config["llm_timeout"] = 360
+    # Rate limits: OpenRouter allows 20 RPM / 1000 RPD (paid). Our 5-stock
+    # parallel run is ~60 calls over ~24 min (~2.5 RPM, ~5 concurrent burst) —
+    # well under limits. Let the OpenAI SDK's native retry handle the rare 429:
+    # it respects the Retry-After header and backs off exponentially (default
+    # 2 retries). Disabling it (max_retries=0) made a single transient 429 fail
+    # the call outright — the old custom capacity guard was built for the Nous
+    # portal's instability and is not wired to the OpenRouter path anyway.
+    config["llm_max_retries"] = 2
+    config["llm_timeout"] = 120
     # Role-aware LLM routing (spec 2026-08-24 §4/§5): per-node model, reasoning
     # effort and completion cap. No global max_tokens / max reasoning /
     # temperature / top_p — provider defaults for reasoning models (§3.3/3.4).
