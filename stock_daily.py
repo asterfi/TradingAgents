@@ -30,8 +30,8 @@ ORDERS = os.path.join(LANE, "orders.json")
 LOG = os.path.join(LANE, "stock-log.jsonl")
 
 TICKERS = ["NVDA", "TSLA", "AAPL", "AMD", "SPY"]
-EQUITY_USD = 37.5  # fallback; refreshed from MEXC live balance at placement
-RISK_PCT = 0.05  # operator-set 2026-08-24: 5% of equity per trade (was 2.6%)
+EQUITY_USD = 37.5  # legacy fallback — NEVER used in live mode (fail closed; 2026-08-25)
+RISK_PCT = 0.05  # operator-set 2026-08-24: 5% of day-start capital per trade
 DAY_CAPITAL_FILE = os.path.join(LANE, "day-capital.json")
 
 
@@ -45,13 +45,14 @@ def _load_day_capital():
     return None
 
 
-def _day_start_capital(date=None):
+def _day_start_capital(date=None, live=True):
     """Fixed capital base for the day: first equity read is snapshotted and
     reused for every trade that day (operator directive 2026-08-24: 5% of
     STARTING capital per trade, not floating equity).
 
-    If no snapshot exists for the date, capture the live USDT equity now and
-    persist it; all brackets placed that day risk risk_pct of THIS number.
+    2026-08-25 hardening: in LIVE mode a failed equity read returns None —
+    the $37.5 default must never silently size a live order (Codex
+    §orchestration item 6). Only non-live callers may use the fallback.
     """
     date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     snap = _load_day_capital()
@@ -72,7 +73,7 @@ def _day_start_capital(date=None):
                     return eq
     except Exception:
         pass
-    return EQUITY_USD
+    return None if live else EQUITY_USD
 
 
 def _live_equity_usd():
@@ -153,8 +154,14 @@ def run_ta_parallel(date, test=False, timeout=3600):
     return results
 
 
-def stage_from_verdict(res):
-    """Build a bracket payload from a TA result. Returns None if no trade."""
+def stage_from_verdict(res, live=True):
+    """Build a bracket payload from a TA result. Returns None if no trade.
+
+    2026-08-25 hardening (Codex §"strict PM contract"): NO wrapper-generated
+    fallback entry/TP/SL — if the PM gave no explicit levels, there is no
+    trade (missing levels must become NO_TRADE, never an invented 1%/2R
+    bracket). Capital unavailable in live mode also means no trade.
+    """
     ticker = res.get("ticker")
     verdict = res.get("ta_verdict") or res.get("verdict")
     params = res.get("trade_params") or {}
@@ -162,25 +169,18 @@ def stage_from_verdict(res):
     if verdict not in ("BUY", "SELL") or not close:
         return None
     side = "LONG" if verdict == "BUY" else "SHORT"
-    entry = params.get("entry") or close
+    entry = params.get("entry")
     tp = params.get("take_profit")
     sl = params.get("stop_loss")
-    # defaults if the model gave none: 1 ATR stop, 2R target (needs ATR from snapshot)
-    if not sl or not tp:
-        atr = None
-        try:
-            art = os.path.join(LANE, "results", "atr_cache.json")
-            if os.path.exists(art):
-                atr = json.load(open(art)).get(ticker)
-        except Exception:
-            pass
-        if not sl:
-            sl = entry * (1 - 0.01) if side == "LONG" else entry * (1 + 0.01)  # 1% fallback
-        if not tp:
-            tp = entry + 2 * (entry - sl) if side == "LONG" else entry - 2 * (sl - entry)
+    # missing any explicit level → NO_TRADE (no fallback levels, ever)
+    if entry is None or tp is None or sl is None:
+        return None
+    equity = _day_start_capital(live=live)
+    if equity is None or equity <= 0:
+        return None  # fail closed: unknown capital sizes nothing in live mode
     from mexc_orders import build_bracket
     return build_bracket(ticker, side, entry, tp, sl,
-                         equity_usd=_live_equity_usd(), risk_pct=RISK_PCT,
+                         equity_usd=equity, risk_pct=RISK_PCT,
                          execution=params.get("execution", "limit"),
                          invalidation=params.get("invalidation"))
 
@@ -258,29 +258,45 @@ def preopen(date, test=False, execute=False, dry=False):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=1)
         os.replace(tmp, ORDERS)
-        if execute:
-            from mexc_orders import place_bracket
-            for br in staged:
-                try:
-                    resp = place_bracket(br, dry_run=dry)  # dry=True: build only, no send
-                    if isinstance(resp, dict) and resp.get("invalidated"):
-                        br["status"] = "invalidated"
-                        br["reason"] = resp.get("reason")
-                    else:
-                        br["status"] = "dry_placed" if dry else "placed"
-                        br["order_id"] = resp.get("data", {}).get("orderId")
-                except Exception as e:
-                    br["status"] = f"error: {str(e)[:150]}"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=1)
-            os.replace(tmp, ORDERS)
+    if execute and not test:
+        from mexc_orders import place_bracket
+        for br in staged:
+            try:
+                resp = place_bracket(br, dry_run=dry)  # dry=True: build only, no send
+                if isinstance(resp, dict) and resp.get("invalidated"):
+                    br["status"] = "invalidated"
+                    br["reason"] = resp.get("reason")
+                elif isinstance(resp, dict) and resp.get("probe_failed"):
+                    br["status"] = "probe_failed"
+                    br["reason"] = resp.get("reason")
+                elif isinstance(resp, dict) and resp.get("admission_rejected"):
+                    br["status"] = f"admission_{resp['admission']['decision']}"
+                    br["reason"] = resp["admission"].get("detail", {}).get("error") or \
+                        resp["admission"]["decision"]
+                else:
+                    br["status"] = "dry_placed" if dry else "placed"
+                    br["order_id"] = resp.get("data", {}).get("orderId")
+            except Exception as e:
+                br["status"] = f"error: {str(e)[:150]}"
+        failed = [b for b in staged if b.get("status", "").startswith(("error", "admission_", "probe_failed"))]
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, ORDERS)
+        # partial failure visibility (Codex §orchestration item 5): any
+        # placement failure must be loud in the digest, not silently swallowed
+        if failed:
+            print("⚠️ PLACEMENT FAILURES: " + ", ".join(
+                f"{b.get('ticker')} [{b.get('status')}]" for b in failed))
     # summary — polished per-asset due-diligence digest for Telegram
     verdict_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪", "UNKNOWN": "⚫"}
     vcount = {"BUY": 0, "SELL": 0, "HOLD": 0, "UNKNOWN": 0}
+    day_cap = _live_equity_usd()
+    cap_line = (f"💰 Day capital: ${day_cap:.0f} · 5% risk = **${round(day_cap*0.05, 2):.2f}** each"
+                if day_cap else "⚠️ Day capital UNAVAILABLE — no live sizing possible (fail closed)")
     lines = [
         "🚀 *TA-SHADOW PRE-OPEN* — " + date,
         "🤖 TradingAgents due diligence · 5 stocks",
-        f"💰 Day capital: ${_live_equity_usd():.0f} · 5% risk = **${round(_live_equity_usd()*0.05, 2):.2f}** each",
+        cap_line,
         "",
     ]
     for r in results:
@@ -323,9 +339,16 @@ def preopen(date, test=False, execute=False, dry=False):
         elif execute:
             lines.append(f"🎯 *{placed}/{len(staged)} bracket orders PLACED LIVE*")
             invalidated = [b.get("ticker") for b in staged if b.get("status") == "invalidated"]
-            failed = [b.get("ticker") for b in staged if b.get("status") not in ("placed", "invalidated")]
+            admitted_skip = [(b.get("ticker"), b.get("status")) for b in staged
+                             if str(b.get("status", "")).startswith("admission_")]
+            failed = [b.get("ticker") for b in staged
+                      if b.get("status") not in ("placed", "invalidated")
+                      and not str(b.get("status", "")).startswith("admission_")]
             if invalidated:
                 lines.append(f"   ⚪ skipped (price already past SL): {', '.join(invalidated)}")
+            for tk, st in admitted_skip:
+                # admission governor decision, machine-readable reason
+                lines.append(f"   ⛔ {tk}: skipped — governor [{st[len('admission_'):]}]")
             if failed:
                 lines.append(f"   ⚠️ failed: {', '.join(failed)}")
         else:

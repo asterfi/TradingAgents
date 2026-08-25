@@ -29,15 +29,11 @@ import os
 LANE = os.path.dirname(os.path.abspath(__file__))
 HISTORY = os.path.join(LANE, "results", "trade_history.jsonl")
 
-# MEXC symbol <=> our ticker
-MEXC_SYMBOLS = {
-    "NVDA": "NVDA_USDT",
-    "TSLA": "TESLA_USDT",
-    "AAPL": "AAPLSTOCK_USDT",
-    "AMD": "AMD_USDT",
-    "SPY": "SPY_USDT",
-}
-TICKER_FROM_MEXC = {v: k for k, v in MEXC_SYMBOLS.items()}
+# Canonical MEXC symbol map (2026-08-25 hardening): position_ctx previously
+# used NVDA_USDT / AMD_USDT — WRONG (MEXC stock perps are NVIDIA_USDT /
+# AMDSTOCK_USDT), making overnight NVDA/AMD positions invisible to the
+# agents. Import the single source of truth instead of a local copy.
+from symbols import TICKER_TO_MEXC, TICKER_FROM_MEXC  # canonical map (single source of truth)
 
 
 def _load_history():
@@ -70,31 +66,53 @@ def record_trade_outcome(entry: dict):
     return True
 
 
-def get_open_positions():
+def get_open_positions(raise_on_error=False):
     """Current MEXC open positions on our universe → {ticker: {...}}.
 
     Only price/side/qty/leverage fields — P&L/uPnL are never carried here
     (operator directive: no money figures reach the agents).
+
+    2026-08-25 hardening (Codex §"empty vs error"): an API failure used to
+    return {} — indistinguishable from "confirmed none", which silently
+    un-blocked same-ticker re-entry and the risk governor. Now: pass
+    raise_on_error=True for the fail-closed path (the executor uses this);
+    default returns {} with an "error" note ONLY for display contexts, and
+    the digest/analysis path reports the failure instead of implying flat.
     """
+    error = None
     try:
         from mexc_orders import _mexc_request
         resp = _mexc_request("GET", "/api/v1/private/position/open_positions", {})
         data = resp.get("data") or []
-    except Exception:
-        return {}
+        if not isinstance(data, list):
+            raise RuntimeError(f"malformed open_positions data: {type(data).__name__}")
+    except Exception as e:
+        if raise_on_error:
+            raise
+        error = str(e)[:150]
     out = {}
-    for p in data:
-        sym = p.get("symbol")
-        tk = TICKER_FROM_MEXC.get(sym)
-        if not tk:
-            continue
-        out[tk] = {
-            "side": "LONG" if p.get("positionType") == 1 else "SHORT",
-            "entry": p.get("holdAvgPrice"),
-            "qty": p.get("holdVol"),
-            "liq": p.get("liquidatePrice"),
-            "leverage": p.get("leverage"),
-        }
+    if error is None:
+        for p in data:
+            sym = p.get("symbol")
+            tk = TICKER_FROM_MEXC.get(sym)
+            if not tk:
+                continue
+            try:
+                vol = float(p.get("holdVol") or 0)
+            except (TypeError, ValueError):
+                continue
+            if vol <= 0:
+                continue
+            out[tk] = {
+                "side": "LONG" if p.get("positionType") == 1 else "SHORT",
+                "entry": p.get("holdAvgPrice"),
+                "qty": p.get("holdVol"),
+                "liq": p.get("liquidatePrice"),
+                "leverage": p.get("leverage"),
+            }
+    if error and not out:
+        # surface the failure to callers that check this sentinel
+        out = {"__error__": error}
     return out
 
 
@@ -138,7 +156,11 @@ def build_position_context(ticker):
     position, no history) so the grounding block stays clean.
     """
     lines = []
-    pos = get_open_positions().get(ticker)
+    all_pos = get_open_positions()
+    if "__error__" in all_pos:
+        # state unknown: say so in the informational block — do NOT imply flat
+        lines.append(f"position lookup failed ({all_pos['__error__']}) — live position state unknown")
+    pos = all_pos.get(ticker)
     if pos:
         br = _bracket_for(ticker)
         bits = [f"operator position: {pos['side']} @ {pos['entry']} qty {pos['qty']}"]

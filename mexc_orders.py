@@ -30,14 +30,11 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
+from symbols import TICKER_TO_MEXC  # canonical map (2026-08-25: single source of truth)
+
 LANE = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = os.environ.get("MEXC_API_BASE", "https://api.mexc.com")
 ORDER_FILE = os.path.join(LANE, "orders.json")
-
-TICKER_TO_MEXC = {
-    "NVDA": "NVIDIA_USDT", "TSLA": "TESLA_USDT",
-    "AAPL": "AAPLSTOCK_USDT", "AMD": "AMDSTOCK_USDT", "SPY": "SPY_USDT",
-}
 
 # Defaults if the TA run gives no explicit params: risk 2.6% of ~$37.5 equity,
 # ATR-based stop. Operator-set 2026-08-23: 2.6% equity per trade, MAX leverage
@@ -176,31 +173,55 @@ def build_bracket(ticker, side, entry, take_profit, stop_loss,
 def place_bracket(payload, dry_run=True):
     """Place one bracket order on MEXC (dry_run=True = build only, no send).
 
-    Returns the MEXC response dict (with orderId when live). For market
-    execution, the SL/TP are validated against the LIVE mark price first: if
-    price has already run past the stop, the setup is dead — skip with a clean
-    ``invalidated`` result instead of a failed create call (2026-08-25: SPY
-    rejected with "Short SL price must be higher than current price" because
-    price moved above the SL between analysis and placement).
+    Live path is gated by the deterministic admission governor (2026-08-25
+    hardening, Codex review §Priority 0): fresh MEXC state, 3-position cap,
+    15% aggregate risk, same-ticker exclusion, fail-closed on unknown state,
+    and a post-rounding per-trade risk re-check. A rejected placement returns
+    {"admission": {...}} with a machine-readable reason — it does NOT raise.
+
+    For market execution, the SL is validated against the LIVE mark price
+    first: if price has already run past the stop, the setup is dead — skip
+    with a clean ``invalidated`` result instead of a failed create call
+    (2026-08-25: SPY rejected with "Short SL price must be higher than
+    current price" because price moved above the SL between analysis and
+    placement).
     """
     if dry_run:
         return {"dry_run": True, "payload": payload}
     mexc = payload["mexc_symbol"]
+
+    # --- admission governor (fail-closed; never bypassed) ---------------
+    import admission
+    dec = admission.decide(payload["ticker"], payload.get("risk_usd"))
+    admission.log_admission(payload["ticker"], dec)
+    if not dec["accepted"]:
+        return {"admission_rejected": True, "admission": dec}
+
     # live-price guard for market entries: a stop already beyond the market
     # means the setup is invalidated (and MEXC would reject it anyway).
     if payload.get("execution") == "market":
         try:
             mark = get_mark_price(mexc)
             sl = float(payload["stop_loss"])
+            entry_ref = float(payload.get("entry") or mark)
             if payload["side"] == "SHORT" and mark >= sl:
                 return {"invalidated": True,
                         "reason": f"price {mark} already above SL {sl} — setup dead"}
             if payload["side"] == "LONG" and mark <= sl:
                 return {"invalidated": True,
                         "reason": f"price {mark} already below SL {sl} — setup dead"}
+            # entry/TP sanity vs the fresh executable quote (Codex §execution:
+            # validate entry and TP, not only the SL)
+            if payload["side"] == "SHORT" and mark <= entry_ref * 0.995:
+                return {"invalidated": True,
+                        "reason": f"live price {mark} already below limit entry {entry_ref}"}
+            if payload["side"] == "LONG" and mark >= entry_ref * 1.005:
+                return {"invalidated": True,
+                        "reason": f"live price {mark} already above limit entry {entry_ref}"}
         except Exception as e:
-            # never block placement on a probe failure — MEXC validates anyway
-            print(f"⚠️ mark-price guard skipped for {mexc}: {e}")
+            # live-quote probe failure BLOCKS the order (fail closed — never
+            # fall back to blind placement; Codex §execution item 4)
+            return {"probe_failed": True, "reason": f"mark-price probe failed: {e}"}
     # fetch contract size
     c = get_contract(mexc)
     cs = float(c.get("contractSize") or 0)
@@ -214,6 +235,17 @@ def place_bracket(payload, dry_run=True):
     min_vol = float(c.get("minVol") or 1)
     vol = round(vol, vol_scale)
     vol = max(min_vol, vol)
+    # --- post-rounding risk re-check (governor case 5) ------------------
+    # min-volume/precision rounding can inflate the effective loss at the
+    # stop past the 5% per-trade cap; recompute from the ACTUAL volume.
+    import admission as _adm
+    eff_risk = vol * dist * cs
+    dec = _adm.decide(payload["ticker"], eff_risk)
+    if not dec["accepted"]:
+        _adm.log_admission(payload["ticker"], dec,
+                           {"phase": "post_rounding", "vol": vol, "cs": cs})
+        return {"admission_rejected": True, "admission": dec,
+                "effective_risk_usd": round(eff_risk, 4)}
     body = {
         "symbol": mexc,
         "vol": str(vol),
