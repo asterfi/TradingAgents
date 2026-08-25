@@ -16,6 +16,7 @@ SAFETY: default is STAGE only. --execute must be passed explicitly to touch
 the exchange. Never exceeds 1 bracket per ticker per day.
 """
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -28,6 +29,21 @@ RUN_STOCK = os.path.join(LANE, "run_stock.py")
 SCREEN = os.path.join(LANE, "nyopen_screen.py")
 ORDERS = os.path.join(LANE, "orders.json")
 LOG = os.path.join(LANE, "stock-log.jsonl")
+LOCK_FILE = os.path.join(LANE, ".lane.lock")
+
+
+def _acquire_singleton_lock(kind="lane"):
+    """Singleton lock (Codex §orchestration item 3): overlapping pre-open or
+    sweep/placement invocations are rejected, not interleaved."""
+    try:
+        f = open(LOCK_FILE, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.write(f"{kind} {os.getpid()} {datetime.now(timezone.utc).isoformat()}\n")
+        f.flush()
+        return f  # keep the handle open for the process lifetime
+    except OSError:
+        print(f"⛔ another ta-shadow run holds the lane lock — aborting")
+        return None
 
 TICKERS = ["NVDA", "TSLA", "AAPL", "AMD", "SPY"]
 EQUITY_USD = 37.5  # legacy fallback — NEVER used in live mode (fail closed; 2026-08-25)
@@ -231,6 +247,20 @@ def _portal_healthy(timeout=20):
 
 
 def preopen(date, test=False, execute=False, dry=False):
+    lock = _acquire_singleton_lock("preopen")
+    if lock is None:
+        return 3
+    # --- execution timing (Codex §"Execution and timing") ----------------
+    # The 12:00 UTC analysis is pre-open: decisions are STAGED, never
+    # executed against the prior day's close. Market entries execute only
+    # in the NYSE-open window (sweep/executor phase) with a fresh quote.
+    if execute and not dry:
+        import nyse_calendar
+        if not nyse_calendar.in_open_window():
+            nxt = nyse_calendar.next_open_utc()
+            print(f"⛔ execution refused: outside the NYSE-open window "
+                  f"(next open {nxt.isoformat()}). Decisions remain staged.")
+            return 4
     if not test and not dry and not _portal_healthy():
         print("⚠️ ta-shadow pre-open SKIPPED: LLM provider (OpenRouter) unresponsive. "
               "No orders staged. Will retry next scheduled run.")
@@ -363,6 +393,61 @@ def preopen(date, test=False, execute=False, dry=False):
     return 0
 
 
+def execute_staged(date):
+    """Post-open execution phase (Codex §"Execution and timing").
+
+    Runs INSIDE the NYSE-open window: re-reads today's staged orders and
+    places each one with a fresh executable quote (place_bracket re-fetches
+    live state, re-validates SL/entry/TP, re-runs the admission governor).
+    Staged market entries become live market orders here; limit entries rest.
+    """
+    lock = _acquire_singleton_lock("execute")
+    if lock is None:
+        return 3
+    import nyse_calendar
+    if not nyse_calendar.in_open_window():
+        print(f"⛔ execute_staged refused: outside NYSE-open window "
+              f"(next open {nyse_calendar.next_open_utc().isoformat()})")
+        return 4
+    from mexc_orders import load_orders, place_bracket, save_orders
+    data = load_orders()
+    if data.get("date") != date:
+        print(f"⛔ no staged orders for {date} (orders.json date: {data.get('date')})")
+        return 5
+    staged = [o for o in data.get("orders", []) if o.get("status") == "staged"]
+    if not staged:
+        print("no staged orders to execute")
+        return 0
+    for br in staged:
+        try:
+            resp = place_bracket(br, dry_run=False)
+            if isinstance(resp, dict) and resp.get("invalidated"):
+                br["status"] = "invalidated"; br["reason"] = resp.get("reason")
+            elif isinstance(resp, dict) and resp.get("probe_failed"):
+                br["status"] = "probe_failed"; br["reason"] = resp.get("reason")
+            elif isinstance(resp, dict) and resp.get("admission_rejected"):
+                br["status"] = f"admission_{resp['admission']['decision']}"
+            elif isinstance(resp, dict) and resp.get("duplicate_suppressed"):
+                br["status"] = f"duplicate_suppressed_{resp.get('last_state')}"
+            else:
+                br["status"] = "placed"
+                br["order_id"] = resp.get("data", {}).get("orderId")
+                if isinstance(resp, dict) and resp.get("protection_failed"):
+                    br["status"] = "PROTECTION_FAILED"
+                    br["reason"] = (resp.get("protection") or {}).get("reason")
+        except Exception as e:
+            br["status"] = f"error: {str(e)[:150]}"
+    save_orders(data)
+    failed = [b for b in staged if str(b.get("status", "")).startswith(("error", "admission_", "probe_failed", "PROTECTION_FAILED"))]
+    print(json.dumps({k: b.get(k) for b in staged
+                      for k in ("ticker", "status")}, default=str))
+    if failed:
+        print("⚠️ EXECUTION FAILURES: " + ", ".join(
+            f"{b.get('ticker')} [{b.get('status')}]" for b in failed))
+        return 2
+    return 0
+
+
 def screen_phase(test=False):
     cmd = [VENV_PY, SCREEN, "--dry-run"] if test else [VENV_PY, SCREEN]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -377,6 +462,8 @@ def main():
     ap.add_argument("--screen", action="store_true", help="NY-open fast screen")
     ap.add_argument("--sweep", action="store_true",
                     help="cancel stale unfilled brackets (post-open cleanup + price invalidation)")
+    ap.add_argument("--execute-staged", action="store_true",
+                    help="post-open phase: place today's staged orders inside the NYSE-open window")
     ap.add_argument("--date", default=None)
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--execute", action="store_true", help="place staged orders live")
@@ -388,7 +475,21 @@ def main():
         return preopen(date, test=args.test, execute=args.execute, dry=args.dry)
     if args.screen:
         return screen_phase(test=args.test)
+    if args.execute_staged:
+        return execute_staged(date)
     if args.sweep:
+        lock = _acquire_singleton_lock("sweep")
+        if lock is None:
+            return 3
+        # calendar-aware sweep timing (Codex §execution): a fixed 14:00 UTC
+        # cron runs BEFORE the 14:30 UTC open during U.S. standard time —
+        # the sweep must be relative to the ACTUAL session open.
+        import nyse_calendar
+        sweep_due = nyse_calendar.sweep_time_utc()
+        if datetime.now(timezone.utc) < sweep_due:
+            print(f"⏳ sweep not due yet (open+90m = {sweep_due.isoformat()}); "
+                  f"nothing to do now — orders still have their window.")
+            return 0
         from mexc_orders import sweep_stale_brackets, record_fill_outcomes
         rep = sweep_stale_brackets(dry_run=not args.execute)
         # Record TP/SL outcomes for placed orders that have since closed, so

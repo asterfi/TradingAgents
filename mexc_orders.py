@@ -197,31 +197,38 @@ def place_bracket(payload, dry_run=True):
     if not dec["accepted"]:
         return {"admission_rejected": True, "admission": dec}
 
-    # live-price guard for market entries: a stop already beyond the market
-    # means the setup is invalidated (and MEXC would reject it anyway).
-    if payload.get("execution") == "market":
-        try:
-            mark = get_mark_price(mexc)
-            sl = float(payload["stop_loss"])
-            entry_ref = float(payload.get("entry") or mark)
-            if payload["side"] == "SHORT" and mark >= sl:
-                return {"invalidated": True,
-                        "reason": f"price {mark} already above SL {sl} — setup dead"}
-            if payload["side"] == "LONG" and mark <= sl:
-                return {"invalidated": True,
-                        "reason": f"price {mark} already below SL {sl} — setup dead"}
-            # entry/TP sanity vs the fresh executable quote (Codex §execution:
-            # validate entry and TP, not only the SL)
-            if payload["side"] == "SHORT" and mark <= entry_ref * 0.995:
-                return {"invalidated": True,
-                        "reason": f"live price {mark} already below limit entry {entry_ref}"}
-            if payload["side"] == "LONG" and mark >= entry_ref * 1.005:
-                return {"invalidated": True,
-                        "reason": f"live price {mark} already above limit entry {entry_ref}"}
-        except Exception as e:
-            # live-quote probe failure BLOCKS the order (fail closed — never
-            # fall back to blind placement; Codex §execution item 4)
-            return {"probe_failed": True, "reason": f"mark-price probe failed: {e}"}
+    # live-price guard: validate SL/entry against the fresh executable quote
+    # for BOTH market and limit entries (Codex §execution: validate entry and
+    # TP too, and a probe failure BLOCKS the order — never blind placement).
+    try:
+        mark = get_mark_price(mexc)
+        sl = float(payload["stop_loss"])
+        tp = float(payload["take_profit"])
+        entry_ref = float(payload.get("entry") or mark)
+        if payload["side"] == "SHORT" and mark >= sl:
+            return {"invalidated": True,
+                    "reason": f"price {mark} already above SL {sl} — setup dead"}
+        if payload["side"] == "LONG" and mark <= sl:
+            return {"invalidated": True,
+                    "reason": f"price {mark} already below SL {sl} — setup dead"}
+        # entry sanity vs the fresh quote (both entry types)
+        if payload["side"] == "SHORT" and mark <= entry_ref * 0.995:
+            return {"invalidated": True,
+                    "reason": f"live price {mark} already below limit entry {entry_ref}"}
+        if payload["side"] == "LONG" and mark >= entry_ref * 1.005:
+            return {"invalidated": True,
+                    "reason": f"live price {mark} already above limit entry {entry_ref}"}
+        # TP sanity: the target must still be reachable from the live quote
+        if payload["side"] == "SHORT" and mark <= tp:
+            return {"invalidated": True,
+                    "reason": f"live price {mark} already at/below TP {tp}"}
+        if payload["side"] == "LONG" and mark >= tp:
+            return {"invalidated": True,
+                    "reason": f"live price {mark} already at/above TP {tp}"}
+    except Exception as e:
+        # live-quote probe failure BLOCKS the order (fail closed — never
+        # fall back to blind placement; Codex §execution item 4)
+        return {"probe_failed": True, "reason": f"mark-price probe failed: {e}"}
     # fetch contract size
     c = get_contract(mexc)
     cs = float(c.get("contractSize") or 0)
@@ -265,9 +272,45 @@ def place_bracket(payload, dry_run=True):
                       body={"symbol": mexc, "leverage": payload["leverage"]})
     except Exception as e:
         raise RuntimeError(f"change_leverage failed: {e}") from e
-    resp = _mexc_request("POST", "/api/v1/private/order/create", body=body)
+    # --- idempotency: deterministic external key; skip if already resolved --
+    run_date = payload.get("run_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    oid = external_oid(run_date, payload["ticker"],
+                       f"{payload['side']}_{'MKT' if payload.get('execution') == 'market' else 'LMT'}")
+    payload["external_oid"] = oid
+    prev = journal_latest_for(oid)
+    if prev and prev.get("state") in ("SUBMITTING", "ACCEPTED", "FILLED", "PROTECTED"):
+        # same logical decision already in flight: never duplicate-submit;
+        # report the existing state for reconciliation instead
+        return {"duplicate_suppressed": True, "external_oid": oid,
+                "last_state": prev.get("state"), "journal": prev}
+    journal_transition(oid, payload["ticker"], "SUBMITTING",
+                       {"vol": vol, "entry": payload["entry"]})
+    try:
+        resp = _mexc_request("POST", "/api/v1/private/order/create", body=body)
+    except Exception as e:
+        # network timeout = UNKNOWN, not FAILED: resolve via reconciliation
+        # before any retry (Codex §idempotency)
+        journal_transition(oid, payload["ticker"], "UNKNOWN", {"error": str(e)[:200]})
+        raise
     if not resp.get("success"):
+        journal_transition(oid, payload["ticker"], "FAILED",
+                           {"code": resp.get("code"), "message": resp.get("message")})
         raise RuntimeError(f"order create failed: {resp.get('message')} ({resp.get('code')})")
+    journal_transition(oid, payload["ticker"], "ACCEPTED",
+                       {"orderId": resp.get("data", {}).get("orderId")})
+    # --- post-fill protection: a submitted order is not success until the
+    # position and its protective TP/SL are confirmed (governor case 6) ----
+    if payload.get("execution") == "market":
+        import admission as _adm2
+        prot = _adm2.confirm_protection(mexc)
+        if prot.get("ok"):
+            journal_transition(oid, payload["ticker"], "PROTECTED",
+                               {"tp": prot.get("tp"), "sl": prot.get("sl")})
+        else:
+            journal_transition(oid, payload["ticker"], "PROTECTION_FAILED",
+                               {"reason": prot.get("reason"), "error": prot.get("error")})
+            resp = {**resp, "protection_failed": True,
+                    "protection": {k: prot.get(k) for k in ("reason", "error")}}
     return resp
 
 
@@ -312,6 +355,78 @@ def load_orders():
         except (json.JSONDecodeError, OSError):
             pass
     return {"date": None, "orders": []}
+
+
+# --------------------------------------------------------------------------
+# Idempotency: deterministic client order key + order-state journal
+# (Codex §"Idempotency and order-state reconciliation", 2026-08-25)
+# --------------------------------------------------------------------------
+
+STRATEGY_VERSION = "ta-shadow-2026-08-25"
+ORDER_JOURNAL = os.path.join(LANE, "results", "order_journal.jsonl")
+
+VALID_STATES = ("STAGED", "ADMITTED", "SUBMITTING", "ACCEPTED", "FILLED",
+                "PROTECTED", "CLOSED", "UNKNOWN", "FAILED", "PROTECTION_FAILED")
+
+
+def external_oid(run_date, ticker, action, strategy_version=STRATEGY_VERSION):
+    """Deterministic client order key: run date + ticker + action + strategy
+    version. A retried placement of the same logical decision resolves to the
+    SAME key, so a duplicate submission can be detected and reconciled."""
+    key = f"{strategy_version}:{run_date}:{ticker}:{action}"
+    return "TA-" + hashlib.sha256(key.encode()).hexdigest()[:16].upper()
+
+
+def journal_write(row):
+    """Append one state-transition row to the order journal (atomic-ish append)."""
+    os.makedirs(os.path.dirname(ORDER_JOURNAL), exist_ok=True)
+    with open(ORDER_JOURNAL, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def journal_latest_for(oid):
+    """Most recent journal row for an external order id (or None)."""
+    if not os.path.exists(ORDER_JOURNAL):
+        return None
+    latest = None
+    try:
+        with open(ORDER_JOURNAL) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # malformed history line: skip visibly, not silently
+                if r.get("external_oid") == oid:
+                    latest = r
+    except OSError:
+        return None
+    return latest
+
+
+def journal_transition(oid, ticker, state, detail=None):
+    row = {"ts": datetime.now(timezone.utc).isoformat(),
+           "external_oid": oid, "ticker": ticker, "state": state,
+           "detail": detail or {}}
+    journal_write(row)
+    return row
+
+
+def reconcile_external_order(oid):
+    """Resolve an UNKNOWN or retried placement by live MEXC lookup.
+
+    Returns the open-order row matching our universe (if any), a position
+    on the ticker implied by the journal, or None. Network timeout is
+    UNKNOWN and must be resolved through this BEFORE any resubmit.
+    """
+    from admission import fetch_live_state
+    try:
+        state = fetch_live_state()
+    except Exception:
+        return {"status": "state_error"}
+    return {"status": "ok", "state": state}
 
 
 def get_mark_price(symbol):
