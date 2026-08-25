@@ -299,7 +299,12 @@ def preopen(date, test=False, execute=False, dry=False):
     lines.append(f"📊 Verdicts: 🟢{vcount['BUY']} · 🔴{vcount['SELL']} · ⚪{vcount['HOLD']}")
     if staged:
         placed = sum(1 for b in staged if b.get("status") == "placed")
-        if execute:
+        dry_placed = sum(1 for b in staged if b.get("status") == "dry_placed")
+        if dry and execute:
+            # dry run: brackets built but NOT sent to MEXC
+            lines.append(f"🧪 *DRY RUN* — {len(staged)} bracket(s) built, {dry_placed} validated, NOT placed on MEXC")
+            lines.append(f"   (no live orders sent — dry mode)")
+        elif execute:
             lines.append(f"🎯 *{placed}/{len(staged)} bracket orders PLACED LIVE*")
             failed = [b.get("ticker") for b in staged if b.get("status") != "placed"]
             if failed:
