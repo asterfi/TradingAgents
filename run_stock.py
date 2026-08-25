@@ -47,16 +47,11 @@ GROK_43           = "x-ai/grok-4.3"                     # challenger trader/PM (
 HY3               = "tencent/hy3"                        # challenger synthesis (no strict-schema roles)
 
 # --- Role -> (model, reasoning_effort, max_completion_tokens) ---
-# CHAMPION stack (live; spec 2026-08-24 §4 table). Controlled rollout
-# (Codex §"Controlled rollout"): the challenger stacks below are replay-only
-# until scored on saved snapshots; promotion is a separate decision.
-#
-# Effort rules (Codex §"Effort rules", 2026-08-25):
-# - no `low` on DeepSeek V4 Flash (0731 accepts high/xhigh; `low` removed
-#   even though the endpoint accepts it — high is the floor for evidence work)
-# - `xhigh` only where deep evidence integration pays (market, fundamentals)
-# - advocacy roles stay at `high` (max reasoning helps rationalize weak theses)
-# - reflection: no LLM-billed deep think — minimal cap, high effort
+# LIVE STACK: four-family (promoted 2026-08-25 after a clean end-to-end
+# smoke test on NVDA: strict-schema PM output, validation clean, $0.049/run).
+# DeepSeek evidence, Gemini opposition, Grok adjudication, HY3 synthesis.
+# Effort rules: high floor everywhere (no `low`), xhigh only for
+# market/fundamentals evidence integration and the PM decision.
 ROLE_LLMS = {
     "market":            (DEEPSEEK_V4_FLASH, "xhigh", 24576),
     "sentiment":         (DEEPSEEK_V4_FLASH, "high",   8192),  # shadow mode = deterministic; cost floor only
@@ -73,8 +68,10 @@ ROLE_LLMS = {
     "reflection":        (DEEPSEEK_V4_FLASH, "high",   8192),
 }
 
-# CHALLENGER A (Codex §"Controlled rollout" step 2): Grok 4.3 replaces the
-# Luna Trader/PM path. Replay-only.
+# CHALLENGER stacks (kept for A/B replay and instant rollback):
+# - champion: the 2026-08-24 Luna-PM stack (rollback target if four-family
+#   degrades — one-line revert of the --stack default)
+# - grok-pm / grok-hy3: intermediate rollouts from the Codex plan
 ROLE_LLMS_CHALLENGER_A = {**ROLE_LLMS,
     "trader":            (GROK_43,           "high",  16384),
     "portfolio_manager": (GROK_43,           "high",  32768),
@@ -87,18 +84,18 @@ ROLE_LLMS_CHALLENGER_B = {**ROLE_LLMS_CHALLENGER_A,
     "neutral":           (HY3,               "high",  16384),
 }
 
-# FULL four-family map (step 4): DeepSeek evidence, Gemini opposition,
-# Grok adjudication, HY3 synthesis. Replay-only until scored.
-ROLE_LLMS_CHALLENGER_FULL = {**ROLE_LLMS_CHALLENGER_B,
+# four-family (LIVE): DeepSeek evidence, Gemini opposition, Grok
+# adjudication, HY3 synthesis — promoted 2026-08-25.
+ROLE_LLMS_FOUR_FAMILY = {**ROLE_LLMS_CHALLENGER_B,
     "market":            (DEEPSEEK_V4_FLASH, "xhigh", 24576),
     "fundamentals":      (DEEPSEEK_V4_FLASH, "xhigh", 24576),
 }
 
 STACKS = {
+    "four-family": ROLE_LLMS_FOUR_FAMILY,
     "champion": ROLE_LLMS,
     "grok-pm": ROLE_LLMS_CHALLENGER_A,
     "grok-hy3": ROLE_LLMS_CHALLENGER_B,
-    "four-family": ROLE_LLMS_CHALLENGER_FULL,
 }
 
 # quick/deep slots kept for upstream back-compat; both resolve to the
@@ -326,9 +323,10 @@ def main():
     ap.add_argument("--ticker", required=True, choices=["NVDA", "TSLA", "AAPL", "AMD", "SPY"])
     ap.add_argument("--date", default=None, help="trade date (default: today UTC)")
     ap.add_argument("--variant", default="A", choices=["A", "B"])
-    ap.add_argument("--stack", default="champion",
+    ap.add_argument("--stack", default="four-family",
                     choices=list(STACKS),
-                    help="model stack: champion (live) or a replay-only challenger")
+                    help="model stack: four-family (live, promoted 2026-08-25 after a clean "
+                         "end-to-end smoke test) or champion/grok-pm/grok-hy3 replays")
     ap.add_argument("--session", action="store_true", help="include live session fields if market open")
     ap.add_argument("--test", action="store_true", help="mark row test=true")
     ap.add_argument("--results-dir", default=os.path.join(LANE, "results"))
