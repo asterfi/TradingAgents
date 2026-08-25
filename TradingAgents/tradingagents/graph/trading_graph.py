@@ -228,9 +228,8 @@ class TradingAgentsGraph:
             kwargs["max_retries"] = _coerce_max_retries(max_retries)
 
         # Per-call wall-clock cap (forwarded to the OpenAI SDK). Without it a
-        # stalled socket hangs an unattended run forever; with the Nous
-        # capacity-backoff wrapper in place, timeouts surface as retryable
-        # failures instead of dead air.
+        # stalled socket hangs an unattended run forever; timeouts surface as
+        # retryable failures (SDK max_retries) instead of dead air.
         timeout_s = self.config.get("llm_timeout")
         if timeout_s is not None and timeout_s != "":
             kwargs["timeout"] = float(timeout_s)

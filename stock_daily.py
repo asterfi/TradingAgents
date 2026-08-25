@@ -103,8 +103,8 @@ def run_ta(ticker, date, test=False, timeout=3600):
 def run_ta_parallel(date, test=False, timeout=3600):
     """Run the 5 TA evaluations in parallel (one subprocess per ticker).
 
-    A single stock takes ~25-40 min on the Nous portal; sequential 5-stock
-    would blow the 90-min pre-open window. Parallel brings wall-clock down to
+    A single stock takes ~10-15 min of LLM calls; sequential 5-stock
+    would blow the pre-open window. Parallel brings wall-clock down to
     roughly one stock's runtime.
     """
     procs = {}

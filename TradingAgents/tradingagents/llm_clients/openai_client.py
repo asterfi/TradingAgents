@@ -167,8 +167,7 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature", "top_p",
     "api_key", "callbacks", "http_client", "http_async_client",
-    # Output-token cap. Critical for the Nous portal: without it the model's
-    # hidden-thinking phase is unbounded (measured 2026-08-23).
+    # Output-token cap for reasoning models with hidden-thinking phases.
     "max_tokens",
 )
 
@@ -210,189 +209,6 @@ class ProviderSpec:
     use_responses_api: bool = False           # native OpenAI Responses API
 
 
-class NousChatOpenAI(NormalizedChatOpenAI):
-    """Nous Research portal quirk guard: retry-on-empty for stealth models.
-
-    ox-alpha (stealth preview) intermittently returns bursty empty completions
-    (observed 2026-08-23 on the Hermes gateway: 3 consecutive empty responses).
-    langchain's max_retries only retries on API-level errors, not on
-    content-free 200s — so a single empty completion would poison an agent's
-    report (e.g. an analyst writing "" instead of analysis) and cascade into a
-    garbage final verdict. Retry up to 3x on truly-empty text; give up honestly
-    after that rather than fabricating output.
-    """
-
-    _NOUS_EMPTY_RETRIES = 3
-
-    # 401s (key rejected) are retried this many times with a fresh key before
-    # giving up — the portal flaps 401s in brief waves then recovers. With the
-    # 10-20s backoff this rides out ~3-4 min of continuous 401s.
-    _AUTH_RETRIES = 12
-
-    # Capacity-wave survival: the Nous portal's stealth models intermittently
-    # return 429 "temporarily at capacity upstream" (not a key rate limit).
-    # Observed 2026-08-23: a wave long enough to exhaust langchain_openai's
-    # retry budget (~2 min) and kill the run. This lane is an unattended daily
-    # batch with no deadline, so ride waves out: long exponential backoff with
-    # jitter (60s → 8m ceiling), up to 12 attempts (~45 min worst case per call).
-    _CAPACITY_ATTEMPTS = 12
-    _CAPACITY_BASE_S = 60
-    _CAPACITY_CEIL_S = 480
-
-    def _refresh_key(self):
-        """Re-read Hermes' live Nous key from auth.json (rotates hourly).
-
-        Long graph runs (25-40 min) outlive the rotating agent_key; without
-        this a 401 mid-run kills the whole stock lane. Refreshing before every
-        attempt costs one tiny file read and keeps the key current.
-
-        IMPORTANT: langchain's OpenAI client caches the key at build time
-        (self.root_client). Merely setting self.openai_api_key does NOT affect
-        in-flight requests. The client builds LAZILY (`if not self.client:`),
-        so resetting client/root_client to None forces a rebuild with the new
-        key on the next invoke.
-        """
-        try:
-            with open(os.path.expanduser("~/.hermes/auth.json")) as f:
-                nous = json.load(f).get("providers", {}).get("nous", {})
-            key = nous.get("agent_key") or nous.get("access_token")
-            if not key:
-                return
-            old = getattr(self, "openai_api_key", None)
-            os.environ["NOUS_API_KEY"] = key
-            try:
-                self.openai_api_key = key
-            except Exception:
-                pass
-            # langchain's OpenAI client caches the key at build time inside
-            # validate_environment() (self.root_client). If the key rotated,
-            # re-run validate_environment() so the next invoke uses the fresh
-            # key. Only rebuild when the key actually changed.
-            if old != key:
-                try:
-                    self.validate_environment()
-                except Exception:
-                    pass
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    def invoke(self, input, config=None, **kwargs):
-        import random
-        import time as _time
-
-        def _has_payload(r):
-            return isinstance(r, AIMessage) and (bool((r.content or "").strip()) or bool(r.tool_calls))
-
-        # Capture the base-class stream method once; super() inside a nested
-        # closure has no class context.
-        _base_stream = super().stream
-
-        def _stream_invoke(input, config, **kwargs):
-            """Stream the request internally and aggregate to an AIMessage.
-
-            The Nous portal is dramatically faster and more timeout-resilient
-            when streaming (190s non-stream vs 53s stream for the market
-            analyst's long report, measured 2026-08-23). Streaming keeps the
-            same return shape (AIMessage) so all graph nodes benefit without
-            changing their code.
-
-            Tool calls are aggregated the SDK-blessed way: AIMessageChunk
-            supports additive `+` merging, which handles tool-call fragments
-            (id on first chunk, args split across later chunks) correctly.
-            """
-            from langchain_core.messages import AIMessageChunk
-            acc = None
-            for ch in _base_stream(input, config=config, **kwargs):
-                m = getattr(ch, "message", ch)
-                acc = m if acc is None else (acc + m)
-            if acc is None:
-                return AIMessage(content="")
-            if type(acc).__name__ == "AIMessageChunk":
-                # normalize to a plain AIMessage so downstream (langgraph)
-                # treats it identically to a non-streaming result
-                from langchain_core.messages import AIMessageChunk
-                if isinstance(acc, AIMessageChunk):
-                    acc = AIMessage(
-                        content=acc.content,
-                        tool_calls=getattr(acc, "tool_calls", None) or [],
-                        additional_kwargs=getattr(acc, "additional_kwargs", None) or {},
-                    )
-            return acc
-
-        for attempt in range(self._CAPACITY_ATTEMPTS):
-            self._refresh_key()
-            try:
-                result = _stream_invoke(input, config, **kwargs)
-                break
-            except Exception as e:
-                body = getattr(e, "body", None)
-                status = getattr(e, "status_code", None) or (
-                    body.get("status") if isinstance(body, dict) else None)
-                ename = str(type(e).__name__)
-                # 401 = key rejected. Portal-down or key-revoked signature. The
-                # 2026-08-23 portal flap strikes 401s in brief waves then
-                # recovers (observed repeatedly mid-graph). Refresh the key +
-                # rebuild the client and retry a few times BEFORE giving up —
-                # but cap it so a genuinely dead portal fails fast instead of
-                # grinding the full backoff.
-                if status == 401 or "AuthenticationError" in ename or "401" in str(e)[:200]:
-                    self._refresh_key()
-                    if attempt >= self._AUTH_RETRIES:
-                        raise RuntimeError(
-                            "nous: 401 persists after key refresh — "
-                            "portal down or key revoked. Not a capacity issue."
-                        ) from e
-                    # short backoff so we ride out a 1-3 min 401 flap
-                    # (observed repeatedly 2026-08-23) without hammering
-                    _time.sleep(random.uniform(10, 20))
-                    print(f"[nous] key 401, refreshed (attempt {attempt + 1}/"
-                          f"{self._AUTH_RETRIES + 1}); retrying", flush=True)
-                    continue
-                # Retryable upstream pain: explicit 429s AND timeouts (the
-                # 2026-08-23 drought first showed as multi-minute response
-                # stalls, then 429s — same capacity queue, two symptoms).
-                # ALSO retry mid-stream drops (RemoteProtocolError /
-                # incomplete reads) — the portal drops long streaming
-                # generations intermittently; a retry typically succeeds.
-                rate_limited = (status == 429 or "429" in ename
-                                or "Timeout" in ename or "timeout" in str(e)[:200]
-                                or "RemoteProtocolError" in ename
-                                or "incomplete" in str(e)[:200]
-                                or "connection" in str(e)[:200].lower()
-                                or "chunked" in str(e)[:200].lower())
-                if not rate_limited:
-                    raise
-                # Last attempt: back off and retry once more instead of
-                # raising — the portal's long-generations can exceed any
-                # fixed timeout during capacity waves. We only give up after
-                # the FULL budget (CAPACITY_ATTEMPTS) is consumed.
-                if attempt == self._CAPACITY_ATTEMPTS - 1:
-                    raise RuntimeError(
-                        "nous: capacity/timeout budget exhausted after "
-                        f"{self._CAPACITY_ATTEMPTS} attempts"
-                    ) from e
-                delay = min(self._CAPACITY_CEIL_S,
-                            self._CAPACITY_BASE_S * (2 ** attempt))
-                delay = random.uniform(delay * 0.5, delay)
-                reason = "429 capacity" if (status == 429 or "429" in ename) else "upstream timeout"
-                print(f"[nous] {reason}, backing off {delay:.0f}s "
-                      f"(attempt {attempt + 1}/{self._CAPACITY_ATTEMPTS})",
-                      flush=True)
-                _time.sleep(delay)
-        else:
-            raise RuntimeError("nous: invoke loop exhausted without result")
-        for _ in range(self._NOUS_EMPTY_RETRIES):
-            if _has_payload(result):
-                break
-            result = _stream_invoke(input, config, **kwargs)
-        if not _has_payload(result):
-            raise RuntimeError(
-                "nous: model returned an empty response after "
-                f"{self._NOUS_EMPTY_RETRIES + 1} attempts"
-            )
-        return result
-
-
 # Single source of truth for the OpenAI-compatible provider family. Dual-region
 # providers (qwen/glm/minimax) keep separate endpoints because international and
 # China accounts cannot share credentials (#758).
@@ -407,8 +223,6 @@ OPENAI_COMPATIBLE_PROVIDERS: dict[str, ProviderSpec] = {
     "minimax":    ProviderSpec(base_url="https://api.minimax.io/v1", chat_class=MinimaxChatOpenAI),
     "minimax-cn": ProviderSpec(base_url="https://api.minimaxi.com/v1", chat_class=MinimaxChatOpenAI),
     "openrouter": ProviderSpec(base_url="https://openrouter.ai/api/v1"),
-    "nous":       ProviderSpec(base_url="https://inference-api.nousresearch.com/v1",
-                               chat_class=NousChatOpenAI),
     "mistral":    ProviderSpec(base_url="https://api.mistral.ai/v1"),
     "kimi":       ProviderSpec(base_url="https://api.moonshot.ai/v1"),
     "groq":       ProviderSpec(base_url="https://api.groq.com/openai/v1"),

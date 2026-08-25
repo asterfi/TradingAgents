@@ -76,29 +76,12 @@ PRICE = {
 PEAK_WINDOWS = [(1, 4), (6, 10)]
 
 
-def bridge_nous_key():
-    """Expose Hermes' rotating Nous agent_key as NOUS_API_KEY (never stored)."""
-    if os.environ.get("NOUS_API_KEY"):
-        return "env"
-    auth_path = os.path.expanduser("~/.hermes/auth.json")
-    try:
-        with open(auth_path) as f:
-            nous = json.load(f).get("providers", {}).get("nous", {})
-        key = nous.get("agent_key") or nous.get("access_token")
-        if not key:
-            return None
-        os.environ["NOUS_API_KEY"] = key
-        return "auth.json"
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def bridge_openrouter_key():
     """Expose Hermes' OpenRouter API key as OPENROUTER_API_KEY (never stored).
 
     The key lives in ~/.hermes/.env; read it at runtime so the lane never
-    holds a copy in its own .env or on disk. No rotation (unlike the Nous
-    agent_key), so a single read at process start is enough.
+    holds a copy in its own .env or on disk. A single read at process start
+    is enough.
     """
     if os.environ.get("OPENROUTER_API_KEY"):
         return "env"
@@ -326,8 +309,7 @@ def main():
     # well under limits. Let the OpenAI SDK's native retry handle the rare 429:
     # it respects the Retry-After header and backs off exponentially (default
     # 2 retries). Disabling it (max_retries=0) made a single transient 429 fail
-    # the call outright — the old custom capacity guard was built for the Nous
-    # portal's instability and is not wired to the OpenRouter path anyway.
+    # the call outright.
     config["llm_max_retries"] = 2
     config["llm_timeout"] = 120
     # Role-aware LLM routing (spec 2026-08-24 §4/§5): per-node model, reasoning
