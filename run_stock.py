@@ -30,6 +30,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 from stock_snapshot import fetch_stock_snapshot, build_stock_grounding_block
+from position_ctx import build_position_context
 
 # ============================================================
 # LLM wiring — role-aware three-model stack (spec 2026-08-24).
@@ -324,6 +325,7 @@ def main():
     config["shadow_snapshot"] = {
         "kind": "stock", "snapshot": snap, "symbol": args.ticker,
         "variant": args.variant, "position_blind": False,
+        "operator_context": build_position_context(args.ticker),
     }
     config["results_dir"] = os.path.join(args.results_dir, trade_date)
 

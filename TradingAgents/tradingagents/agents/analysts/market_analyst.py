@@ -66,8 +66,11 @@ def create_market_analyst(llm):
             if shadow.get("kind") == "stock":
                 block = build_stock_grounding_block(snapshot,
                                                     variant=shadow.get("variant", "A"))
+                opctx = shadow.get("operator_context") or ""
                 system_message = (
-                    SHADOW_STOCK_MARKET_PROMPT + "\n\n" + block + "\n" + get_language_instruction()
+                    SHADOW_STOCK_MARKET_PROMPT + "\n\n" + block
+                    + ("\n" + opctx if opctx else "")
+                    + "\n" + get_language_instruction()
                 )
             else:
                 block = build_grounding_block(snapshot, symbol,

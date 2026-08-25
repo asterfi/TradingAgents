@@ -366,8 +366,12 @@ def main():
     if args.screen:
         return screen_phase(test=args.test)
     if args.sweep:
-        from mexc_orders import sweep_stale_brackets
+        from mexc_orders import sweep_stale_brackets, record_fill_outcomes
         rep = sweep_stale_brackets(dry_run=not args.execute)
+        # Record TP/SL outcomes for placed orders that have since closed, so
+        # tomorrow's pre-open agents see how their last trades ended.
+        outcomes = record_fill_outcomes(dry_run=not args.execute)
+        rep["outcomes"] = outcomes
         print(json.dumps(rep, indent=1))
         return 0 if not rep["errors"] else 2
     ap.print_help()

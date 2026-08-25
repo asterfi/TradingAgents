@@ -370,6 +370,74 @@ def save_orders(data):
     os.replace(tmp, ORDER_FILE)
 
 
+def record_fill_outcomes(now=None, dry_run=True):
+    """Record trade outcomes for orders we placed that have since closed.
+
+    MEXC's contract API has no position-history endpoint, so we derive the
+    outcome ourselves: compare our recorded *placed* orders against the
+    currently-open positions. An order that is no longer resting AND has no
+    open position either hit its TP or SL (or was closed manually) — we
+    record which by comparing the last known price direction, and stamp the
+    row with today's date + the position's realized P&L when available.
+
+    Idempotent on order_id. dry_run=True reports only (no history writes).
+    """
+    now = now or datetime.now(timezone.utc)
+    report = {"recorded": [], "still_open": [], "errors": []}
+    book = load_orders().get("orders", [])
+    if not book:
+        return report
+    try:
+        from position_ctx import get_open_positions, record_trade_outcome
+    except Exception as e:
+        report["errors"].append(f"position_ctx import: {e}")
+        return report
+
+    open_pos = get_open_positions()
+    placed = [o for o in book if o.get("status") == "placed" and o.get("order_id")]
+    for o in placed:
+        tk = o.get("ticker")
+        sym = o.get("mexc_symbol")
+        # still has an open position → not closed
+        if open_pos.get(tk):
+            report["still_open"].append(tk)
+            continue
+        # no open position → closed. Determine reason from TP/SL vs current px.
+        try:
+            px = get_mark_price(sym)
+        except Exception as e:
+            report["errors"].append(f"{tk}: mark: {e}")
+            continue
+        side = o.get("side")
+        tp, sl = o.get("take_profit"), o.get("stop_loss")
+        if side == "SHORT":
+            outcome = "TP hit" if px <= tp else ("SL hit" if px >= sl else "closed")
+        else:
+            outcome = "TP hit" if px >= tp else ("SL hit" if px <= sl else "closed")
+        entry = o.get("entry")
+        # Realized P&L is only knowable from MEXC position history (unavailable),
+        # so we record the outcome + current price; the digest shows direction.
+        row = {
+            "date": now.strftime("%Y-%m-%d"),
+            "ticker": tk,
+            "side": side,
+            "entry": entry,
+            "outcome": outcome,
+            "px_now": px,
+            "order_id": o.get("order_id"),
+            "closed_at": now.isoformat(),
+        }
+        if not dry_run:
+            try:
+                record_trade_outcome(row)
+                report["recorded"].append(tk)
+            except Exception as e:
+                report["errors"].append(f"{tk}: record: {e}")
+        else:
+            report["recorded"].append(tk + " (dry)")
+    return report
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
