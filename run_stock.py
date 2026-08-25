@@ -160,7 +160,7 @@ def parse_verdict(text):
         return "UNKNOWN", None
     _, label = min(found)
     mapping = {"BUY": "BUY", "OVERWEIGHT": "BUY", "HOLD": "HOLD",
-               "UNDERWEIGHT": "SELL", "SELL": "SELL"}
+               "UNDERWEIGHT": "HOLD", "SELL": "SELL"}
     m = re.search(r"confiden[ce]*[:\\s]*([0-9]+(?:\\.[0-9]+)?)", text, re.IGNORECASE)
     conf = float(m.group(1)) if m else None
     return mapping[label], conf
