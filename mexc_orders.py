@@ -176,11 +176,31 @@ def build_bracket(ticker, side, entry, take_profit, stop_loss,
 def place_bracket(payload, dry_run=True):
     """Place one bracket order on MEXC (dry_run=True = build only, no send).
 
-    Returns the MEXC response dict (with orderId when live).
+    Returns the MEXC response dict (with orderId when live). For market
+    execution, the SL/TP are validated against the LIVE mark price first: if
+    price has already run past the stop, the setup is dead — skip with a clean
+    ``invalidated`` result instead of a failed create call (2026-08-25: SPY
+    rejected with "Short SL price must be higher than current price" because
+    price moved above the SL between analysis and placement).
     """
     if dry_run:
         return {"dry_run": True, "payload": payload}
     mexc = payload["mexc_symbol"]
+    # live-price guard for market entries: a stop already beyond the market
+    # means the setup is invalidated (and MEXC would reject it anyway).
+    if payload.get("execution") == "market":
+        try:
+            mark = get_mark_price(mexc)
+            sl = float(payload["stop_loss"])
+            if payload["side"] == "SHORT" and mark >= sl:
+                return {"invalidated": True,
+                        "reason": f"price {mark} already above SL {sl} — setup dead"}
+            if payload["side"] == "LONG" and mark <= sl:
+                return {"invalidated": True,
+                        "reason": f"price {mark} already below SL {sl} — setup dead"}
+        except Exception as e:
+            # never block placement on a probe failure — MEXC validates anyway
+            print(f"⚠️ mark-price guard skipped for {mexc}: {e}")
     # fetch contract size
     c = get_contract(mexc)
     cs = float(c.get("contractSize") or 0)

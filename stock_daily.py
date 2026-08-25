@@ -263,8 +263,12 @@ def preopen(date, test=False, execute=False, dry=False):
             for br in staged:
                 try:
                     resp = place_bracket(br, dry_run=dry)  # dry=True: build only, no send
-                    br["status"] = "dry_placed" if dry else "placed"
-                    br["order_id"] = resp.get("data", {}).get("orderId")
+                    if isinstance(resp, dict) and resp.get("invalidated"):
+                        br["status"] = "invalidated"
+                        br["reason"] = resp.get("reason")
+                    else:
+                        br["status"] = "dry_placed" if dry else "placed"
+                        br["order_id"] = resp.get("data", {}).get("orderId")
                 except Exception as e:
                     br["status"] = f"error: {str(e)[:150]}"
             with open(tmp, "w") as f:
@@ -318,7 +322,10 @@ def preopen(date, test=False, execute=False, dry=False):
             lines.append(f"   (no live orders sent — dry mode)")
         elif execute:
             lines.append(f"🎯 *{placed}/{len(staged)} bracket orders PLACED LIVE*")
-            failed = [b.get("ticker") for b in staged if b.get("status") != "placed"]
+            invalidated = [b.get("ticker") for b in staged if b.get("status") == "invalidated"]
+            failed = [b.get("ticker") for b in staged if b.get("status") not in ("placed", "invalidated")]
+            if invalidated:
+                lines.append(f"   ⚪ skipped (price already past SL): {', '.join(invalidated)}")
             if failed:
                 lines.append(f"   ⚠️ failed: {', '.join(failed)}")
         else:
