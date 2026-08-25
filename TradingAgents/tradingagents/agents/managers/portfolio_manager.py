@@ -55,6 +55,12 @@ def create_portfolio_manager(llm):
 - **Underweight**: Reduce exposure, take partial profits
 - **Sell**: Exit position or avoid entry
 
+**Trade Action (REQUIRED — this is the only field the execution system obeys):**
+- Exactly one of: `LONG_ENTRY` | `SHORT_ENTRY` | `NO_TRADE` | `MANAGE_EXISTING`
+- The rating is portfolio GUIDANCE only: **Sell/Underweight ≠ automatic short**, **Overweight/Buy ≠ automatic long**. If you intend a new position, say so explicitly via LONG_ENTRY or SHORT_ENTRY with entry, TP and SL all set.
+- `MANAGE_EXISTING`: an operator position is already open on this ticker — never emit LONG_ENTRY/SHORT_ENTRY for it.
+- Invalid, missing, or contradictory trade actions are treated as NO_TRADE.
+
 **TP / SL — ALWAYS REQUIRED for any non-Hold rating (Buy / Overweight / Underweight / Sell).** You already see the support/resistance levels in the data — set them now:
 - **Take Profit**: the level where the move is expected to exhaust (resistance for a long, support for a short). Reward = entry-to-TP distance.
 - **Stop Loss**: just beyond the level that invalidates the trade (below support for a long, above resistance for a short). Risk = entry-to-SL distance.

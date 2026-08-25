@@ -197,7 +197,30 @@ class PortfolioDecision(BaseModel):
     rating: PortfolioRating = Field(
         description=(
             "The final position rating. Exactly one of Buy / Overweight / Hold / "
-            "Underweight / Sell, picked based on the analysts' debate."
+            "Underweight / Sell, picked based on the analysts' debate. "
+            "INFORMATIONAL ONLY — the executable intent is trade_action."
+        ),
+    )
+    trade_action: str = Field(
+        default="NO_TRADE",
+        description=(
+            "The STRICT executable intent. Exactly one of: LONG_ENTRY (open a new "
+            "long position), SHORT_ENTRY (open a new short position), NO_TRADE "
+            "(no new position today), MANAGE_EXISTING (an operator position is "
+            "already open on this ticker; do not open another). "
+            "A Sell/Underweight rating is portfolio guidance, NOT automatically a "
+            "short entry — a SHORT_ENTRY must be emitted explicitly with all "
+            "required fields. An Overweight rating is NOT automatically a "
+            "LONG_ENTRY."
+        ),
+    )
+    entry_price: float | None = Field(
+        default=None,
+        description=(
+            "REQUIRED for LONG_ENTRY / SHORT_ENTRY: the reference entry price in "
+            "the instrument's quote currency, taken from a level or the last "
+            "close shown in the snapshot. Set null for NO_TRADE / "
+            "MANAGE_EXISTING."
         ),
     )
     executive_summary: str = Field(
@@ -262,10 +285,21 @@ class PortfolioDecision(BaseModel):
         ),
     )
 
-    @field_validator("price_target", "take_profit", "stop_loss", mode="before")
+    @field_validator("price_target", "take_profit", "stop_loss", "entry_price", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
+
+    @field_validator("trade_action", mode="before")
+    @classmethod
+    def _normalize_trade_action(cls, v):
+        """Map any casing/spacing variant to the canonical enum vocabulary;
+        unknown values fall back to NO_TRADE (fail closed — a missing or
+        invalid action must never become an entry)."""
+        if not isinstance(v, str):
+            return "NO_TRADE"
+        canon = v.strip().upper().replace(" ", "_").replace("-", "_")
+        return canon if canon in ("LONG_ENTRY", "SHORT_ENTRY", "NO_TRADE", "MANAGE_EXISTING") else "NO_TRADE"
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
@@ -279,10 +313,14 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     parts = [
         f"**Rating**: {decision.rating.value}",
         "",
+        f"**Trade Action**: {decision.trade_action}",
+        "",
         f"**Executive Summary**: {decision.executive_summary}",
         "",
         f"**Investment Thesis**: {decision.investment_thesis}",
     ]
+    if decision.entry_price is not None:
+        parts.extend(["", f"**Entry Price**: {decision.entry_price}"])
     if decision.price_target is not None:
         parts.extend(["", f"**Price Target**: {decision.price_target}"])
     if decision.take_profit is not None:

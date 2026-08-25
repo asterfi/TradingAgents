@@ -71,6 +71,37 @@ def validate_verdict(
         ok = False
         reasons.append(f"invalid verdict label: {verdict!r}")
 
+    # --- strict PM contract (2026-08-25 hardening, Codex §"strict PM") --
+    # A directional verdict REQUIRES explicit, finite, non-null entry/TP/SL.
+    # No wrapper fallbacks exist anymore — missing values fail closed.
+    if verdict in ("BUY", "SELL"):
+        for field in ("entry", "take_profit", "stop_loss"):
+            v = params.get(field)
+            if v is None:
+                ok = False
+                reasons.append(f"{field} missing for directional verdict (no fallback)")
+            elif not _is_finite_number(v):
+                ok = False
+                reasons.append(f"{field}={v!r} not a finite number")
+
+    # --- freshness: validated from the timestamp value, not its presence -
+    as_of = snapshot.get("as_of")
+    if verdict in ("BUY", "SELL"):
+        if not as_of:
+            ok = False
+            reasons.append("snapshot has no as_of timestamp")
+        else:
+            try:
+                snap_date = datetime.strptime(str(as_of)[:10], "%Y-%m-%d")
+                now = datetime.now(timezone.utc).date()
+                age_days = (now - snap_date.date()).days
+                if age_days > 4:  # allow weekends + one holiday margin
+                    ok = False
+                    reasons.append(f"snapshot stale: as_of {as_of} is {age_days} days old")
+            except ValueError:
+                ok = False
+                reasons.append(f"unparseable as_of {as_of!r}")
+
     # --- execution type (spec §9: market | limit | none) ---------------
     execution = (params.get("execution") or "limit").lower()
     if execution not in ("market", "limit", "none"):
@@ -176,3 +207,10 @@ def _is_sane_price(x) -> bool:
         return 0.01 < float(x) < 1_000_000
     except (TypeError, ValueError):
         return False
+
+
+def _is_finite_number(x) -> bool:
+    """True for int/float (not bool) that is finite and non-NaN."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    return x == x and x not in (float("inf"), float("-inf"))

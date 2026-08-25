@@ -151,20 +151,27 @@ def estimate_cost_calls(calls):
 
 
 def parse_verdict(text):
-    """BUY/HOLD/SELL (+ confidence) from decision text."""
+    """BUY/HOLD/SELL (+ confidence) from decision text.
+
+    2026-08-25 hardening (Codex §"verdict semantics"): the executable
+    verdict is derived ONLY from the strict trade_action field —
+    LONG_ENTRY -> BUY, SHORT_ENTRY -> SELL, anything else -> HOLD.
+    Qualitative ratings (Sell/Underweight/Overweight) are informational and
+    can NEVER create a directional entry by themselves.
+    """
     if not text:
         return "UNKNOWN", None
-    t = text.upper()
-    order = ["BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"]
-    found = [(t.find(k), k) for k in order if k in t]
-    if not found:
-        return "UNKNOWN", None
-    _, label = min(found)
-    mapping = {"BUY": "BUY", "OVERWEIGHT": "BUY", "HOLD": "HOLD",
-               "UNDERWEIGHT": "HOLD", "SELL": "SELL"}
-    m = re.search(r"confiden[ce]*[:\\s]*([0-9]+(?:\\.[0-9]+)?)", text, re.IGNORECASE)
-    conf = float(m.group(1)) if m else None
-    return mapping[label], conf
+    m = re.search(r"trade\s*action[*:\s]*`?(LONG_ENTRY|SHORT_ENTRY|NO_TRADE|MANAGE_EXISTING)`?",
+                  text, re.IGNORECASE)
+    if m:
+        action = m.group(1).upper()
+        verdict = {"LONG_ENTRY": "BUY", "SHORT_ENTRY": "SELL"}.get(action, "HOLD")
+    else:
+        # no strict trade_action emitted -> NO_TRADE (fail closed)
+        verdict = "HOLD"
+    m2 = re.search(r"confiden[ce]*[:\s]*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    conf = float(m2.group(1)) if m2 else None
+    return verdict, conf
 
 
 def thesis_from_decision(text, limit=140):
@@ -255,10 +262,18 @@ def parse_trade_params(text, close):
                    text, re.IGNORECASE)
     if em:
         params["execution"] = em.group(1).lower()
-    # fallback to snapshot close for entry when not stated
+    # 2026-08-25 hardening: NO close-fallback for entry — a missing explicit
+    # entry is a NO_TRADE (stage_from_verdict rejects it); the wrapper must
+    # never invent an entry price the PM did not state.
     if params["entry"] is None:
-        params["entry"] = close
-    if params["take_profit"] and params["stop_loss"]:
+        m = re.search(r"entry(?:\s*(?:price|at))?\s*[*:\s]*\$?\s*([0-9]+(?:\.[0-9]+)?)",
+                      text, re.IGNORECASE)
+        if m:
+            try:
+                params["entry"] = float(m.group(1))
+            except ValueError:
+                pass
+    if params["entry"] is not None and params["take_profit"] and params["stop_loss"]:
         r = (params["take_profit"] - params["entry"]) / (params["entry"] - params["stop_loss"])
         params["risk_reward"] = round(r, 2)
     return params
