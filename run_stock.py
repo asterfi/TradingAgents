@@ -43,36 +43,78 @@ PROVIDER = "openrouter"
 DEEPSEEK_V4_FLASH = "deepseek/deepseek-v4-flash-0731"   # volume: analysts, debate, risk
 GEMINI_FLASH      = "google/gemini-3.7-flash"           # opposition: bear + conservative
 LUNA_PRO          = "openai/gpt-5.6-luna-pro"           # adjudicator: manager/trader/PM
+GROK_43           = "x-ai/grok-4.3"                     # challenger trader/PM (Codex §model)
+HY3               = "tencent/hy3"                        # challenger synthesis (no strict-schema roles)
 
 # --- Role -> (model, reasoning_effort, max_completion_tokens) ---
-# Spec §4 table. Per-role output caps, no global 384K allowance, no global
-# max reasoning, no forced temperature/top_p (provider defaults; §3.3/§3.4).
+# CHAMPION stack (live; spec 2026-08-24 §4 table). Controlled rollout
+# (Codex §"Controlled rollout"): the challenger stacks below are replay-only
+# until scored on saved snapshots; promotion is a separate decision.
+#
+# Effort rules (Codex §"Effort rules", 2026-08-25):
+# - no `low` on DeepSeek V4 Flash (0731 accepts high/xhigh; `low` removed
+#   even though the endpoint accepts it — high is the floor for evidence work)
+# - `xhigh` only where deep evidence integration pays (market, fundamentals)
+# - advocacy roles stay at `high` (max reasoning helps rationalize weak theses)
+# - reflection: no LLM-billed deep think — minimal cap, high effort
 ROLE_LLMS = {
-    "market":            (DEEPSEEK_V4_FLASH, "high",  12288),
-    "sentiment":         (DEEPSEEK_V4_FLASH, "low",    8192),
+    "market":            (DEEPSEEK_V4_FLASH, "xhigh", 24576),
+    "sentiment":         (DEEPSEEK_V4_FLASH, "high",   8192),  # shadow mode = deterministic; cost floor only
     "news":              (DEEPSEEK_V4_FLASH, "high",  12288),
-    "fundamentals":      (DEEPSEEK_V4_FLASH, "high",  12288),
-    "bull_researcher":   (DEEPSEEK_V4_FLASH, "high",  12288),
+    "fundamentals":      (DEEPSEEK_V4_FLASH, "xhigh", 24576),
+    "bull_researcher":   (DEEPSEEK_V4_FLASH, "high",  16384),
     "bear_researcher":   (GEMINI_FLASH,      "high",  16384),
     "research_manager":  (LUNA_PRO,          "xhigh", 32768),
     "trader":            (LUNA_PRO,          "high",  16384),
-    "aggressive":        (DEEPSEEK_V4_FLASH, "high",   8192),
+    "aggressive":        (DEEPSEEK_V4_FLASH, "high",  12288),
     "neutral":           (DEEPSEEK_V4_FLASH, "high",   8192),
     "conservative":      (GEMINI_FLASH,      "high",  16384),
     "portfolio_manager": (LUNA_PRO,          "xhigh", 32768),
-    "reflection":        (DEEPSEEK_V4_FLASH, "low",    4096),
+    "reflection":        (DEEPSEEK_V4_FLASH, "high",   8192),
 }
+
+# CHALLENGER A (Codex §"Controlled rollout" step 2): Grok 4.3 replaces the
+# Luna Trader/PM path. Replay-only.
+ROLE_LLMS_CHALLENGER_A = {**ROLE_LLMS,
+    "trader":            (GROK_43,           "high",  16384),
+    "portfolio_manager": (GROK_43,           "high",  32768),
+}
+
+# CHALLENGER B (step 3): + HY3 synthesis roles (Research Manager / Neutral
+# Risk — prose synthesis only, NO tool-required or strict-schema roles).
+ROLE_LLMS_CHALLENGER_B = {**ROLE_LLMS_CHALLENGER_A,
+    "research_manager":  (HY3,               "high",  24576),
+    "neutral":           (HY3,               "high",  16384),
+}
+
+# FULL four-family map (step 4): DeepSeek evidence, Gemini opposition,
+# Grok adjudication, HY3 synthesis. Replay-only until scored.
+ROLE_LLMS_CHALLENGER_FULL = {**ROLE_LLMS_CHALLENGER_B,
+    "market":            (DEEPSEEK_V4_FLASH, "xhigh", 24576),
+    "fundamentals":      (DEEPSEEK_V4_FLASH, "xhigh", 24576),
+}
+
+STACKS = {
+    "champion": ROLE_LLMS,
+    "grok-pm": ROLE_LLMS_CHALLENGER_A,
+    "grok-hy3": ROLE_LLMS_CHALLENGER_B,
+    "four-family": ROLE_LLMS_CHALLENGER_FULL,
+}
+
 # quick/deep slots kept for upstream back-compat; both resolve to the
 # volume model (the graph now reads ROLE_LLMS for per-node routing).
 DEEP_THINK_LLM = DEEPSEEK_V4_FLASH
 QUICK_THINK_LLM = DEEPSEEK_V4_FLASH
 
-# OpenRouter list rates (per 1M tokens), verified live 2026-08-24 from the
-# /models endpoint (spec §15). Used for honest per-run cost attribution.
+# OpenRouter list rates (per 1M tokens), verified live 2026-08-25 from the
+# /models endpoint (refresh of the stale 2026-08-24 table, Codex §"Update
+# the local price table"). Used for honest per-run cost attribution.
 PRICE = {
-    "deepseek/deepseek-v4-flash-0731": {"in": 0.14, "out": 0.28},
-    "google/gemini-3.7-flash":         {"in": 0.375, "out": 1.875},
-    "openai/gpt-5.6-luna-pro":         {"in": 0.20, "out": 1.20},
+    "deepseek/deepseek-v4-flash-0731": {"in": 0.0616, "out": 0.1232},
+    "google/gemini-3.7-flash":         {"in": 0.375,  "out": 1.875},
+    "openai/gpt-5.6-luna-pro":         {"in": 0.20,   "out": 1.20},
+    "x-ai/grok-4.3":                   {"in": 1.25,   "out": 2.50},
+    "tencent/hy3":                     {"in": 0.132,  "out": 0.528},
 }
 PEAK_WINDOWS = [(1, 4), (6, 10)]
 
@@ -284,6 +326,9 @@ def main():
     ap.add_argument("--ticker", required=True, choices=["NVDA", "TSLA", "AAPL", "AMD", "SPY"])
     ap.add_argument("--date", default=None, help="trade date (default: today UTC)")
     ap.add_argument("--variant", default="A", choices=["A", "B"])
+    ap.add_argument("--stack", default="champion",
+                    choices=list(STACKS),
+                    help="model stack: champion (live) or a replay-only challenger")
     ap.add_argument("--session", action="store_true", help="include live session fields if market open")
     ap.add_argument("--test", action="store_true", help="mark row test=true")
     ap.add_argument("--results-dir", default=os.path.join(LANE, "results"))
@@ -295,6 +340,7 @@ def main():
         print(json.dumps({"error": "no OpenRouter credential"}))
         return 1
     os.makedirs(args.results_dir, exist_ok=True)
+    role_stack = STACKS[args.stack]
 
     snap = fetch_stock_snapshot(args.ticker, session=args.session)
     close = snap["levels"]["close"]
@@ -306,8 +352,8 @@ def main():
                       "bull_researcher", "bear_researcher", "research_manager",
                       "trader", "aggressive", "neutral", "conservative",
                       "portfolio_manager", "reflection"}
-    missing_roles = REQUIRED_ROLES - set(ROLE_LLMS)
-    bad_roles = {r for r, s in ROLE_LLMS.items()
+    missing_roles = REQUIRED_ROLES - set(role_stack)
+    bad_roles = {r for r, s in role_stack.items()
                  if not s or len(s) != 3 or not s[0] or s[1] not in
                  ("low", "high", "xhigh") or int(s[2]) <= 0}
     if missing_roles or bad_roles:
@@ -331,7 +377,7 @@ def main():
     # Role-aware LLM routing (spec 2026-08-24 §4/§5): per-node model, reasoning
     # effort and completion cap. No global max_tokens / max reasoning /
     # temperature / top_p — provider defaults for reasoning models (§3.3/3.4).
-    config["role_llms"] = ROLE_LLMS
+    config["role_llms"] = role_stack
     # Graph controls (spec §5): one debate round, one risk round, recursion 40.
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
@@ -366,7 +412,7 @@ def main():
     params = parse_trade_params(str(pm_text) or decision, close)
     # Deterministic post-verdict validation (spec §10): fail-closed to HOLD.
     from verdict_validator import validate_verdict
-    vres = validate_verdict(verdict, params, snap, role_llms=ROLE_LLMS)
+    vres = validate_verdict(verdict, params, snap, role_llms=role_stack)
     if vres["ok"]:
         # Reattach the parsed confidence on pass; the validator nulls it on fail.
         vres["confidence"] = confidence
@@ -392,7 +438,8 @@ def main():
         "variant": args.variant,
         "llm_provider": PROVIDER, "llm_model": DEEP_THINK_LLM, "key_source": key_source,
         "role_llms": {r: {"model": s[0], "reasoning_effort": s[1], "max_tokens": s[2]}
-                      for r, s in ROLE_LLMS.items()},
+                      for r, s in role_stack.items()},
+        "stack": args.stack,
         "as_of": snap["as_of"], "close": close,
         "ta_verdict": verdict, "confidence": confidence,
         "trade_params": params,

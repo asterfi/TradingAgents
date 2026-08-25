@@ -163,6 +163,32 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
         return payload
 
 
+class OpenRouterChatOpenAI(NormalizedChatOpenAI):
+    """OpenRouter-specific client (2026-08-25 hardening, Codex §provider).
+
+    - ``require_parameters: true`` in every request body: OpenRouter must
+      FAIL the call (not silently drop) when a requested parameter —
+      reasoning_effort, structured outputs — is unsupported by the routed
+      provider.
+    - Telemetry headers so every call records the resolved provider
+      (OpenRouter routes model IDs across inference providers; a pinned
+      model ID alone is not reproducibility).
+    """
+
+    def __init__(self, *args, **kwargs):
+        headers = kwargs.pop("extra_headers", None) or {}
+        headers.setdefault("HTTP-Referer", "https://hermes.local/ta-shadow")
+        headers.setdefault("X-Title", "ta-shadow")
+        kwargs["extra_headers"] = headers
+        super().__init__(*args, **kwargs)
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        extra_body = payload.setdefault("extra_body", {})
+        extra_body.setdefault("require_parameters", True)
+        return payload
+
+
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature", "top_p",
@@ -222,7 +248,7 @@ OPENAI_COMPATIBLE_PROVIDERS: dict[str, ProviderSpec] = {
     "glm-cn":     ProviderSpec(base_url="https://open.bigmodel.cn/api/paas/v4/"),
     "minimax":    ProviderSpec(base_url="https://api.minimax.io/v1", chat_class=MinimaxChatOpenAI),
     "minimax-cn": ProviderSpec(base_url="https://api.minimaxi.com/v1", chat_class=MinimaxChatOpenAI),
-    "openrouter": ProviderSpec(base_url="https://openrouter.ai/api/v1"),
+    "openrouter": ProviderSpec(base_url="https://openrouter.ai/api/v1", chat_class=OpenRouterChatOpenAI),
     "mistral":    ProviderSpec(base_url="https://api.mistral.ai/v1"),
     "kimi":       ProviderSpec(base_url="https://api.moonshot.ai/v1"),
     "groq":       ProviderSpec(base_url="https://api.groq.com/openai/v1"),
