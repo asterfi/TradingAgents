@@ -5,21 +5,26 @@ each ticker completely blind — no knowledge of an already-open position on
 that ticker, and no memory of how their last trade on it ended. This module
 gives the grounding block two informational lines:
 
-  1. OPEN POSITION  — live MEXC position on this ticker (side/entry/uPnL/SL).
-  2. LAST TRADE     — our own recorded outcome for this ticker (TP hit / SL
-                      hit / still open / manual, +/−$ and R), read from a
-                      trade_history.jsonl we append at the sweep.
+  1. OPEN POSITION  — live MEXC position on this ticker (side/entry/qty +
+                      the bracket's TP/SL from our order book). NO P&L.
+  2. LAST TRADE     — our own recorded outcome for this ticker, phrased as
+                      "SL hit from that day's analysis/trigger" etc. NO $,
+                      NO uPnL, NO PnL, NO R.
+
+Money figures are deliberately excluded: the operator's directive (2026-08-25)
+is that agents must never receive P&L/uPnL values because they can hallucinate
+around them. They get context on what their prior analysis produced and where
+the live position stands in price terms — and do their own analysis.
 
 MEXC's contract API does not expose deal/position *history* (only current
-open positions), so last-trade outcomes are recorded by us — ground truth is
-our own orders.json + position deltas, not an exchange history endpoint.
+open positions), so last-trade outcomes are recorded by us at sweep time —
+ground truth is our own orders.json + position deltas.
 
 The block is injected as informational context: the agents may weigh it, but
 it is NOT a directive. They still decide from the snapshot first.
 """
 import json
 import os
-from datetime import datetime, timezone
 
 LANE = os.path.dirname(os.path.abspath(__file__))
 HISTORY = os.path.join(LANE, "results", "trade_history.jsonl")
@@ -66,7 +71,11 @@ def record_trade_outcome(entry: dict):
 
 
 def get_open_positions():
-    """Current MEXC open positions on our universe → {ticker: {...}}."""
+    """Current MEXC open positions on our universe → {ticker: {...}}.
+
+    Only price/side/qty/leverage fields — P&L/uPnL are never carried here
+    (operator directive: no money figures reach the agents).
+    """
     try:
         from mexc_orders import _mexc_request
         resp = _mexc_request("GET", "/api/v1/private/position/open_positions", {})
@@ -83,12 +92,23 @@ def get_open_positions():
             "side": "LONG" if p.get("positionType") == 1 else "SHORT",
             "entry": p.get("holdAvgPrice"),
             "qty": p.get("holdVol"),
-            "upnl": p.get("unRealizedPnl"),
             "liq": p.get("liquidatePrice"),
             "leverage": p.get("leverage"),
-            "realised": p.get("realised"),
         }
     return out
+
+
+def _bracket_for(ticker):
+    """TP/SL of our placed bracket for this ticker (from orders.json)."""
+    try:
+        from mexc_orders import load_orders
+        book = load_orders().get("orders", [])
+    except Exception:
+        return None
+    for o in reversed(book):
+        if o.get("ticker") == ticker and o.get("status") == "placed":
+            return o
+    return None
 
 
 def last_trade_for(ticker):
@@ -97,26 +117,45 @@ def last_trade_for(ticker):
     return rows[-1] if rows else None
 
 
+def _outcome_phrase(last):
+    """PnL-free phrasing of how the last trade ended.
+
+    e.g. "SL hit (from that day's analysis/trigger)" or "TP hit" or
+    "closed without triggering TP/SL". No $, no R, no uPnL.
+    """
+    outcome = (last.get("outcome") or "").lower()
+    if outcome.startswith("sl"):
+        return "SL hit (from that day's analysis/trigger)"
+    if outcome.startswith("tp"):
+        return "TP hit (from that day's analysis/trigger)"
+    return "closed without triggering TP/SL"
+
+
 def build_position_context(ticker):
     """The informational block for one ticker: open position + last trade.
 
-    Returns "" when there is nothing to say (no position, no history) so the
-    grounding block stays clean on the common no-context day.
+    Money-free by design. Returns "" when there is nothing to say (no
+    position, no history) so the grounding block stays clean.
     """
     lines = []
     pos = get_open_positions().get(ticker)
     if pos:
-        lines.append(
-            f"operator position: {pos['side']} @ {pos['entry']} qty {pos['qty']} "
-            f"uPnL ${pos.get('upnl', 0):+.2f}"
-            + (f" liq {pos['liq']}" if pos.get("liq") else "")
-        )
+        br = _bracket_for(ticker)
+        bits = [f"operator position: {pos['side']} @ {pos['entry']} qty {pos['qty']}"]
+        if br:
+            tp, sl = br.get("take_profit"), br.get("stop_loss")
+            if tp:
+                bits.append(f"TP {tp}")
+            if sl:
+                bits.append(f"SL {sl}")
+        if pos.get("liq"):
+            bits.append(f"liq {pos['liq']}")
+        lines.append(" · ".join(bits))
     last = last_trade_for(ticker)
     if last:
         lines.append(
-            f"last trade ({last.get('date', '?')}): {last.get('side')} "
-            f"exit {last.get('outcome', '?')} P&L ${last.get('pnl_usd', 0):+.2f}"
-            + (f" ({last.get('pnl_r', 0):+.2f}R)" if last.get("pnl_r") is not None else "")
+            f"last trade ({last.get('date', '?')}): {last.get('side')} — "
+            f"{_outcome_phrase(last)}"
         )
     if not lines:
         return ""
