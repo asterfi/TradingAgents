@@ -218,8 +218,8 @@ def _portal_healthy(timeout=20):
         return False
 
 
-def preopen(date, test=False, execute=False):
-    if not test and not _portal_healthy():
+def preopen(date, test=False, execute=False, dry=False):
+    if not test and not dry and not _portal_healthy():
         print("⚠️ ta-shadow pre-open SKIPPED: LLM provider (OpenRouter) unresponsive. "
               "No orders staged. Will retry next scheduled run.")
         return 2
@@ -250,8 +250,8 @@ def preopen(date, test=False, execute=False):
             from mexc_orders import place_bracket
             for br in staged:
                 try:
-                    resp = place_bracket(br, dry_run=False)
-                    br["status"] = "placed"
+                    resp = place_bracket(br, dry_run=dry)  # dry=True: build only, no send
+                    br["status"] = "dry_placed" if dry else "placed"
                     br["order_id"] = resp.get("data", {}).get("orderId")
                 except Exception as e:
                     br["status"] = f"error: {str(e)[:150]}"
@@ -333,10 +333,12 @@ def main():
     ap.add_argument("--date", default=None)
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--execute", action="store_true", help="place staged orders live")
+    ap.add_argument("--dry", action="store_true",
+                    help="full TA flow but build brackets only — NO live MEXC orders (dry run)")
     args = ap.parse_args()
     date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if args.preopen:
-        return preopen(date, test=args.test, execute=args.execute)
+        return preopen(date, test=args.test, execute=args.execute, dry=args.dry)
     if args.screen:
         return screen_phase(test=args.test)
     if args.sweep:
