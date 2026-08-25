@@ -185,37 +185,54 @@ def stage_from_verdict(res):
                          invalidation=params.get("invalidation"))
 
 
-def _portal_healthy(timeout=20):
+def _portal_healthy(timeout=20, attempts=3):
     """Pre-flight: is the LLM provider (OpenRouter) actually responsive?
 
     Switched from Nous to OpenRouter on 2026-08-24 (operator directive) —
     OpenRouter is stable, no hourly key rotation, no capacity flaps. Still
     probe before a full graph run so a down provider bails early with a clear
     message instead of grinding.
+
+    Retries a few times (default 3) with a short backoff so a single transient
+    blip (one slow/failed HTTP call) does NOT abort the whole pre-open run —
+    that was the failure on 2026-08-24 12:00 UTC (probe failed once in ~5s,
+    whole day skipped). The exception reason is printed so future failures are
+    diagnosable instead of a silent False.
     """
-    try:
-        key = os.environ.get("OPENROUTER_API_KEY")
-        if not key:
-            # read from Hermes' .env at runtime (never stored in the lane)
-            hermes_env = os.path.expanduser("~/.hermes/.env")
-            for line in open(hermes_env):
-                if line.strip().startswith("OPENROUTER_API_KEY="):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if not key:
-            return False
-        from openai import OpenAI
-        c = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
-        # Probe with a non-reasoning model that returns plain content — the
-        # pinned 0731 is a reasoning model: with a small max_tokens it spends
-        # the whole budget on reasoning and returns content=None, which would
-        # falsely fail the health probe. Use a cheap content model instead.
-        r = c.chat.completions.create(
-            model="openai/gpt-4o-mini",
-            messages=[{"role": "user", "content": "say OK"}], max_tokens=8)
-        return bool(r.choices) and bool((r.choices[0].message.content or "").strip())
-    except Exception:
-        return False
+    import time as _t
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            key = os.environ.get("OPENROUTER_API_KEY")
+            if not key:
+                # read from Hermes' .env at runtime (never stored in the lane)
+                hermes_env = os.path.expanduser("~/.hermes/.env")
+                for line in open(hermes_env):
+                    if line.strip().startswith("OPENROUTER_API_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+            if not key:
+                print("⚠️ portal probe: no OPENROUTER_API_KEY (env or ~/.hermes/.env)")
+                return False
+            from openai import OpenAI
+            c = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=timeout)
+            # Probe with a non-reasoning model that returns plain content — the
+            # pinned 0731 is a reasoning model: with a small max_tokens it spends
+            # the whole budget on reasoning and returns content=None, which would
+            # falsely fail the health probe. Use a cheap content model instead.
+            r = c.chat.completions.create(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "user", "content": "say OK"}], max_tokens=8)
+            ok = bool(r.choices) and bool((r.choices[0].message.content or "").strip())
+            if ok:
+                return True
+            last_err = "empty response"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:200]}"
+        if attempt < attempts:
+            _t.sleep(attempt * 3)  # 3s, 6s backoff between retries
+    print(f"⚠️ portal probe FAILED after {attempts} attempts — last error: {last_err}")
+    return False
 
 
 def preopen(date, test=False, execute=False, dry=False):
